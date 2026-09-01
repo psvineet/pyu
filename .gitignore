@@ -1,0 +1,5 @@
+pyu_config.json
+pyu.log
+cloudflared.log
+__pycache__/
+*.pyc
