@@ -1,12 +1,13 @@
 # pyu — Python Upload
 
-Drop-anywhere, dependency-free upload endpoint that only your key can talk
-to. Point it at Cloudflare with one command and you have a private,
-locked-down file drop reachable from anywhere — no server admin required.
+Drop-anywhere, dependency-free upload endpoint that only your key (or
+password) can talk to. Point it at Cloudflare with one command and you
+have a private, locked-down file drop reachable from anywhere — no
+server admin required.
 
 A single-file, dependency-free Python HTTP server that exposes one
-API-key-protected upload endpoint, with an optional wizard that stands up
-a Cloudflare Tunnel for you. Built for Termux (Android) but runs on any
+authenticated upload endpoint, with an optional wizard that stands up a
+Cloudflare Tunnel for you. Built for Termux (Android) but runs on any
 Arch, Fedora, or Debian/Ubuntu box too.
 
 No third-party libraries. No framework. Stdlib only. No domain, tunnel,
@@ -30,20 +31,33 @@ first run, on your machine.
   `X-Frame-Options`, `Referrer-Policy`, a restrictive
   `Content-Security-Policy`) — cheap, and closes off a few classes of
   browser-side attacks against the upload page.
-- **API keys, never stored raw** — only `SHA-256(key)` is written to
-  disk. A full disk leak does not hand over a usable key.
-- **Timing-safe auth** — `hmac.compare_digest` for key checks, plus a
-  fixed delay on failed auth to slow brute-forcing.
-- **Per-IP rate limiting** — 20 requests / 10s by default.
+- **Two credential types, both stored safely — but not identically.**
+  API keys are auto-generated, high-entropy, and hashed with fast
+  SHA-256 (fine, since brute-forcing 128+ bits of random output is
+  infeasible regardless of hash speed). The optional human-typable
+  **password** (`-w`) is hashed with **PBKDF2-HMAC-SHA256 at 310,000
+  iterations** instead — deliberately slow, since a password's strength
+  depends on what the user picked, and a leaked config file should not
+  make weak-password guessing cheap. Passwords are also checked for
+  basic strength at set time (12-char minimum, rejects common/weak
+  patterns, all-digit, or overly repetitive strings) before they're
+  ever accepted.
+- **Timing-safe auth** — `hmac.compare_digest` for all credential checks.
+- **Layered rate limiting** — a general per-IP request limit (20 / 10s by
+  default), plus a stricter, separate limit specifically on *failed
+  auth attempts* (5 / 60s by default, tightened once a lower-entropy
+  password credential became possible) to slow down credential guessing
+  without throttling normal traffic.
 - **Randomized storage filenames** — the client's filename is never
   trusted; only a whitelisted extension is kept, name is randomized.
 - **Locked-down permissions** — config `600`, upload dir `700`, saved
   files `600`.
-- **Simple web upload page** — cream/white background, Noto Sans, navy +
-  gold accent. Tries to auto-open the file picker on load; falls back to
-  a single button when the browser blocks that (most do, by design). The
-  page never puts your raw API key on the wire — see
-  [Web page auth](#security-notes) below.
+- **Redesigned web upload page** — card layout, drag-and-drop file zone
+  (tap-to-browse on mobile), live upload progress bar, filename/size
+  preview with a remove button, show/hide toggle on the credential
+  field, and color-coded status messages. Fully responsive down to small
+  phone widths. The page never puts your raw credential on the wire in a
+  secure context — see [Security notes](#security-notes) below.
 - **One-command Cloudflare Tunnel setup** (`-c`) — detects your OS,
   installs `cloudflared`, authorizes, creates the tunnel, adds the DNS
   record, writes the tunnel config to the **standard `/etc/cloudflared`
@@ -58,7 +72,9 @@ first run, on your machine.
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.8+ (tested through 3.14 — no `cgi` module dependency, which
+  was removed from the standard library in newer Python versions;
+  multipart parsing here is hand-rolled and stdlib-only)
 - Termux, or any Linux machine (Arch, Fedora, Debian/Ubuntu and
   derivatives are auto-detected by the `-c` wizard)
 - A Cloudflare account + domain already added to Cloudflare, **if** you
@@ -95,7 +111,32 @@ Your first API key is printed **once**. Copy it now — only its hash is
 ever stored, so a lost key means issuing a new one, not recovering the
 old one.
 
-### 2. (Optional) Set up a public URL with Cloudflare
+### 2. (Optional) Set a password too
+
+```bash
+python3 pyu.py -w
+```
+
+Prompts (hidden input) for a password, **minimum 12 characters**,
+confirmed twice, and rejected outright if it's a common/weak pattern,
+all-digit, or overly repetitive. Unlike API keys, the password itself is
+never hashed with plain SHA-256 — it goes through **PBKDF2-HMAC-SHA256
+at 310,000 iterations**, a deliberately slow hash, specifically because
+a password's real-world strength depends on the human who picked it,
+not on generated entropy. It also keeps an encrypted copy for the
+browser's challenge-response flow, same as keys, and works as a drop-in
+alternative to pasting a long key on the web upload page. It has its own
+key id and can be revoked the same way as any key (`-r <id>`).
+
+> A password is still lower-entropy than a generated key by construction
+> — the strength checks and slow hash reduce the risk of a leaked config
+> being crackable, and the tightened auth-fail rate limit
+> (5 attempts / 60s per IP) slows online guessing to a crawl, but they
+> don't eliminate the gap. If this endpoint is reachable from the open
+> internet, prefer the generated API key for anything you care more
+> about, and don't reuse a password from elsewhere.
+
+### 3. (Optional) Set up a public URL with Cloudflare
 
 ```bash
 python3 pyu.py -c
@@ -130,7 +171,7 @@ re-run `-c`.
 survive a device reboot, and run `termux-wake-lock` so Android doesn't
 kill it in the background.
 
-### 3. Run the server
+### 4. Run the server
 
 ```bash
 python3 pyu.py -d
@@ -142,10 +183,11 @@ python3 pyu.py -d
 On Termux, also run `termux-wake-lock` so Android doesn't kill the
 process — that's outside this script's control.
 
-### 4. Upload
+### 5. Upload
 
-**From a browser:** visit `https://<sub>.<domain>/`, pick a file, paste
-your API key, hit Upload.
+**From a browser:** visit `https://<sub>.<domain>/`, drag a file in (or
+tap to browse), enter your API key or password, hit Upload. A progress
+bar tracks the transfer.
 
 **From the CLI:**
 
@@ -155,18 +197,23 @@ curl -X POST https://<sub>.<domain>/upload \
      -F "file=@/path/to/file"
 ```
 
+(Passwords set via `-w` also work in this header, since they're stored
+the same way as keys.)
+
 ---
 
-## Managing keys
+## Managing credentials
 
 ```bash
-python3 pyu.py -k            # issue another key
-python3 pyu.py -r <key_id>   # revoke one key by its id
+python3 pyu.py -k            # issue another API key
+python3 pyu.py -w            # set/replace the password
+python3 pyu.py -r <key_id>   # revoke one credential (key or password) by its id
 ```
 
-Each key has its own id (printed when issued, and visible in
+Each credential has its own id (printed when issued, and visible in
 `pyu_config.json`), so you can hand different keys to different trusted
-clients and revoke one without affecting the others.
+clients — or set one shared password for casual use — and revoke any one
+without affecting the others.
 
 ---
 
@@ -177,8 +224,9 @@ clients and revoke one without affecting the others.
 | `-i`        | Init: create config + first API key (prompts for domain once)   |
 | `-f`        | Force, used with `-i` to wipe an existing config                |
 | `-k`        | Issue an additional API key                                     |
-| `-r <ID>`   | Revoke a key by its id                                           |
-| `-p <N>`    | Port to listen on (default `820`)                                |
+| `-w`        | Set/replace the web-page password                                |
+| `-r <ID>`   | Revoke a credential (key or password) by its id                  |
+| `-p <N>`    | Port to listen on (default `8820`)                                |
 | `-d`        | Daemonize: detach and keep running after the terminal closes     |
 | `-c`        | Cloudflare wizard: install → auth → tunnel → DNS → config → start |
 | `-h`        | Help                                                              |
@@ -191,17 +239,29 @@ Edit the constants near the top of `pyu.py`:
 
 | Variable            | Default                                      | Meaning                          |
 |---------------------|-----------------------------------------------|-----------------------------------|
-| `PORT`              | `820`                                         | Listen port                       |
+| `PORT`              | `8820`                                        | Listen port                       |
 | `HOST`              | `0.0.0.0`                                     | Listen address                    |
 | `UPLOAD_DIR`        | `/storage/emulated/0/Android/endpoint`        | Where uploads are saved           |
 | `MAX_UPLOAD_BYTES`  | `200 * 1024 * 1024` (200 MB)                  | Hard cap per upload               |
-| `RATE_LIMIT_WINDOW` | `10` seconds                                  | Rate-limit window                 |
+| `RATE_LIMIT_WINDOW` | `10` seconds                                  | General per-IP rate-limit window  |
 | `RATE_LIMIT_MAX`    | `20`                                          | Max requests per IP per window    |
 | `TUNNEL_NAME`       | `pyu-tunnel`                                  | Name used for the Cloudflare tunnel |
+
+Failed-auth-specific limiting (`_AUTH_FAIL_WINDOW` / `_AUTH_FAIL_MAX`,
+default 60s / 5 attempts) is defined near the auth code further down the
+file, separate from the general request rate limit above. `_PBKDF2_ITERATIONS`
+(default 310,000, the current OWASP-recommended floor) controls password
+hash cost and is defined next to `pbkdf2_hash()`.
 
 > **Termux path note:** the correct storage path is
 > `/storage/emulated/0/Android/endpoint`, not `/storage/0/emulated/0/...`,
 > which doesn't exist on Android.
+
+> **Port note:** low ports (<1024) require elevated privileges on most
+> systems and may simply fail to bind on Termux regardless. `8820` is
+> the default for a reason — if you change it, pick something above
+> 1024, and re-run `-c` (or manually edit `config.yml`) so the tunnel's
+> ingress rule points at the new port.
 
 ---
 
@@ -215,9 +275,10 @@ front of it — either by the `-c` Cloudflare wizard above, or your own:
 - any other TLS-terminating reverse proxy or tunnel
 
 **Never** expose the raw port directly to the internet without TLS in
-front of it — the API key would travel in clear text. Prefer a short,
-random subdomain over a predictable word so a scanner that doesn't know
-the hostname can't reach the server at all.
+front of it — credentials would travel in clear text on browsers falling
+back to the plain-header path (see [Security notes](#security-notes)).
+Prefer a short, random subdomain over a predictable word so a scanner
+that doesn't know the hostname can't reach the server at all.
 
 ---
 
@@ -235,13 +296,20 @@ raw_key = "ep_" + base64url( HMAC-SHA256(server_secret, "issue:" + uuid4 + ":" +
 - Verification compares `SHA-256(presented_key)` against the stored hash
   with a timing-safe comparison (`hmac.compare_digest`).
 
+A password set via `-w` follows the same encrypted-copy path for the
+browser challenge, but its verification hash is different by design —
+see [Two credential types](#features) above: PBKDF2-HMAC-SHA256 at
+310,000 iterations, salted, instead of plain SHA-256. This is
+intentional, not an inconsistency: a generated key's entropy makes a
+fast hash safe, a human password's doesn't.
+
 ---
 
 ## Files this creates
 
 | Path                                          | Contents                                    | Perms   |
 |-------------------------------------------------|------------------------------------------------|---------|
-| `pyu_config.json`                                | server secret, key hashes, domain, subdomain    | `600`   |
+| `pyu_config.json`                                | server secret, credential hashes (keys + password), domain, subdomain | `600`   |
 | `<UPLOAD_DIR>/`                                  | uploaded files, randomized names                | `700` dir / `600` files |
 | `pyu.log`                                        | created only with `-d`                          | —       |
 | `/etc/cloudflared/cert.pem`¹                     | Cloudflare origin cert, created by `-c`          | root-owned |
@@ -296,34 +364,52 @@ this repo entirely — so there's nothing repo-local to ignore for them.)
 
 ## Security notes
 
-- **The web page never sends your raw API key over the network.** It
-  fetches a one-time nonce (`GET /nonce`), computes
-  `HMAC-SHA256(rawKey, nonce)` entirely in the browser using the Web
-  Crypto API, and sends only the nonce + that proof to `/upload`. Someone
-  intercepting that traffic gets a nonce that's deleted after first use
-  and a proof tied only to it — neither is replayable, and neither
-  reveals the key. This is on top of, not instead of, TLS in front of the
+- **In a secure browser context (HTTPS, or `localhost`), the web page
+  never sends your raw credential over the network.** It fetches a
+  one-time nonce (`GET /nonce`), computes `HMAC-SHA256(credential,
+  nonce)` entirely in the browser using the Web Crypto API, and sends
+  only the nonce + that proof to `/upload`. Someone intercepting that
+  traffic gets a nonce that's deleted after first use and a proof tied
+  only to it — neither is replayable, and neither reveals the
+  credential. This is on top of, not instead of, TLS in front of the
   server (the `-c` wizard, or your own reverse proxy) — always keep TLS
-  in front too. The nonce store is capped and self-cleaning, so a flood
-  of `GET /nonce` requests can't be used to exhaust server memory.
+  in front too. The nonce store is capped, self-cleaning, and
+  thread-safe, so a flood of `GET /nonce` requests can't be used to
+  exhaust server memory or race the store.
+- **In an insecure context** (plain `http://` on a bare LAN IP, where
+  browsers don't expose the Web Crypto API at all), the page
+  automatically falls back to sending the plain `X-API-Key` header
+  instead of failing outright. This is a deliberate LAN-testing
+  convenience, not a recommended production posture — put TLS in front
+  before exposing this beyond your own network.
 - `curl`/API clients can still use the plain `X-API-Key` header — that
   path is meant for trusted server-to-server calls over a connection you
   control, not for a browser on an arbitrary network.
+- **Failed-auth attempts are rate-limited separately and more strictly**
+  than general traffic (5 attempts / 60s per IP) to slow down
+  credential-guessing without affecting normal upload traffic.
+- **Passwords are hashed differently from API keys on purpose.** Keys
+  use fast SHA-256 (safe, since they're 128+ bits of generated entropy).
+  Passwords use salted PBKDF2-HMAC-SHA256 at 310,000 iterations, plus a
+  strength check at set time (12-char minimum, rejects common/weak,
+  all-digit, or overly repetitive patterns) — both aimed at making a
+  leaked config file's password entry meaningfully harder to crack
+  offline than a key entry needs to be.
 - Treat `pyu_config.json` and everything under `/etc/cloudflared/` (or
   `$PREFIX/etc/cloudflared/` on Termux) like credentials — back them up
   privately, never commit them, never paste them into chat/tickets/logs.
   `pyu_config.json` now also holds a reversibly-encrypted copy of each
-  raw key (protected by the server secret in the same file) so the
-  challenge-response scheme above can work — this defends against
+  raw key/password (protected by the server secret in the same file) so
+  the challenge-response scheme above can work — this defends against
   network interception, not against someone who already has full read
   access to your server's disk.
 - The web page at `/` is unauthenticated by design (it's just the UI);
-  the actual `/upload` endpoint still requires a valid `X-API-Key`.
-- Browsers generally block a page from opening the file picker without a
-  real click — that's a browser security policy, not a bug here. The
-  fallback button covers it.
-- Rotate keys periodically with `-k` / `-r` rather than reusing one key
-  across every trusted client indefinitely.
+  the actual `/upload` endpoint still requires a valid credential.
+- A password (`-w`) is intentionally lower-entropy than a generated API
+  key — convenient for casual/mobile use, but prefer the generated key
+  for anything exposed to the open internet.
+- Rotate credentials periodically with `-k` / `-w` / `-r` rather than
+  reusing one across every trusted client indefinitely.
 
 ---
 
