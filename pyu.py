@@ -22,8 +22,9 @@ FLAGS (all short, single letter)
   -i    init: create config + first API key (asks for your domain once)
   -f    force, used with -i to wipe an existing config
   -k    issue an additional API key
+  -w    set/replace a human-typable password (works alongside API keys)
   -r ID revoke a key by its id
-  -p N  port to listen on (default 820)
+  -p N  port to listen on (default 8820)
   -d    daemonize: detach and keep running after terminal closes
   -c    Cloudflare wizard: install cloudflared if needed, log in,
         create a tunnel, add the DNS record, write cloudflared's config,
@@ -40,7 +41,7 @@ key ONCE - copy it now, only its hash is kept.
 NORMAL RUN
 ----------
     python3 pyu.py
-Listens on 0.0.0.0:820. Put this behind TLS (the -c wizard, or your own
+Listens on 0.0.0.0:8820. Put this behind TLS (the -c wizard, or your own
 reverse proxy) before exposing it to the internet.
 
 CLOUDFLARE WIZARD
@@ -80,14 +81,15 @@ import secrets
 import platform
 import argparse
 import subprocess
-import cgi
 import io
+import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
 # CONFIG - edit these
 # ---------------------------------------------------------------------------
-PORT = 820
+PORT = 8820
 HOST = "0.0.0.0"
 UPLOAD_DIR = "/storage/emulated/0/Android/endpoint"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -102,110 +104,352 @@ TUNNEL_NAME = "pyu-tunnel"
 # ---------------------------------------------------------------------------
 
 _rate_state = {}  # ip -> [timestamps]
+_rate_lock = threading.Lock()
+_auth_fail_state = {}  # ip -> [timestamps of failed auth attempts]
+_auth_fail_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Minimal upload page: cream/white bg, Noto Sans, navy + gold accent.
+# Tiny stdlib-only multipart/form-data parser (replaces removed `cgi` module,
+# gone in Py3.13+). Returns first file field as (filename, bytes) or None.
+# ---------------------------------------------------------------------------
+def parse_multipart_file(body: bytes, content_type: str):
+    m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type)
+    if not m:
+        return None
+    boundary = (m.group(1) or m.group(2)).strip()
+    delim = b"--" + boundary.encode()
+
+    parts = body.split(delim)
+    for part in parts:
+        part = part.strip(b"\r\n")
+        if not part or part == b"--":
+            continue
+        if b"\r\n\r\n" not in part:
+            continue
+        headers_raw, content = part.split(b"\r\n\r\n", 1)
+        content = content.rstrip(b"\r\n")
+        headers_txt = headers_raw.decode(errors="replace")
+        fn_match = re.search(r'filename="([^"]*)"', headers_txt)
+        if fn_match and fn_match.group(1):
+            return fn_match.group(1), content
+    return None
+
+# ---------------------------------------------------------------------------
+# Upload page: card layout, drag-and-drop, progress bar, responsive.
 # ---------------------------------------------------------------------------
 PAGE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Upload</title>
+<title>Secure Upload</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;600;700&display=swap');
-  :root{ --cream:#faf6ef; --navy:#0b2545; --gold:#c9a227; }
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&display=swap');
+  :root{
+    --cream:#faf6ef; --navy:#0b2545; --navy-2:#123162; --gold:#c9a227; --gold-2:#d8b23a;
+    --line:#e4ddcf; --danger:#b3413a; --ok:#2f7d4f;
+  }
   *{box-sizing:border-box;}
-  html,body{ height:100%; margin:0; background:var(--cream); font-family:'Noto Sans', sans-serif; color:var(--navy); }
-  body{ display:flex; align-items:center; justify-content:center; flex-direction:column; gap:22px; padding:24px; text-align:center; }
-  h1{ font-size:1.25rem; font-weight:700; margin:0; letter-spacing:.02em; }
-  #status{ font-size:.9rem; color:var(--navy); opacity:.75; min-height:1.2em; }
+  html,body{ height:100%; margin:0; }
+  body{
+    min-height:100dvh; display:flex; align-items:center; justify-content:center;
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(201,162,39,.10), transparent 60%),
+      radial-gradient(1000px 500px at 110% 110%, rgba(11,37,69,.08), transparent 55%),
+      var(--cream);
+    font-family:'Noto Sans', sans-serif; color:var(--navy); padding:20px;
+  }
+  .card{
+    width:100%; max-width:440px; background:#fff; border-radius:20px;
+    box-shadow:0 20px 50px -20px rgba(11,37,69,.25), 0 2px 8px rgba(11,37,69,.06);
+    padding:32px 28px; border:1px solid var(--line);
+  }
+  .brand{ display:flex; align-items:center; gap:10px; margin-bottom:22px; }
+  .brand-dot{
+    width:10px; height:10px; border-radius:50%; background:var(--gold);
+    box-shadow:0 0 0 4px rgba(201,162,39,.18);
+  }
+  h1{ font-size:1.15rem; font-weight:700; margin:0; letter-spacing:.01em; }
+  .sub{ font-size:.82rem; color:var(--navy); opacity:.6; margin:2px 0 0; }
+
+  label.field-label{
+    display:block; font-size:.78rem; font-weight:600; text-transform:uppercase;
+    letter-spacing:.06em; opacity:.55; margin:20px 0 8px;
+  }
+
+  .key-row{ position:relative; }
   input[type=password], input[type=text]{
-    font-family:inherit; font-size:.95rem; padding:10px 14px; border:1.5px solid var(--navy);
-    border-radius:8px; background:#fff; color:var(--navy); width:min(320px,80vw); outline:none;
+    font-family:inherit; font-size:.95rem; padding:12px 42px 12px 14px; border:1.5px solid var(--line);
+    border-radius:10px; background:#fcfbf8; color:var(--navy); width:100%; outline:none;
+    transition:border-color .15s ease, box-shadow .15s ease;
   }
-  input[type=password]:focus, input[type=text]:focus{ border-color:var(--gold); box-shadow:0 0 0 3px rgba(201,162,39,.25); }
-  button{
-    font-family:inherit; font-weight:600; font-size:1rem; padding:14px 34px; border-radius:10px;
-    border:none; background:var(--navy); color:var(--cream); cursor:pointer; transition:transform .12s ease, background .2s ease;
+  input[type=password]:focus, input[type=text]:focus{
+    border-color:var(--gold); box-shadow:0 0 0 3px rgba(201,162,39,.18); background:#fff;
   }
-  button:hover{ background:#123162; }
-  button:active{ transform:scale(.97); }
-  button.gold{ background:var(--gold); color:var(--navy); }
-  button.gold:hover{ background:#d8b23a; }
+  .key-toggle{
+    position:absolute; right:8px; top:50%; transform:translateY(-50%);
+    background:none; border:none; padding:6px; cursor:pointer; opacity:.5; font-size:.85rem;
+    color:var(--navy); border-radius:6px;
+  }
+  .key-toggle:hover{ opacity:.85; background:rgba(11,37,69,.06); }
+
+  .dropzone{
+    margin-top:20px; border:2px dashed var(--line); border-radius:14px;
+    padding:26px 16px; text-align:center; cursor:pointer; background:#fcfbf8;
+    transition:border-color .15s ease, background .15s ease;
+  }
+  .dropzone:hover{ border-color:var(--gold); background:#fffdf6; }
+  .dropzone.drag{ border-color:var(--gold); background:#fff8e6; }
+  .dz-icon{ margin-bottom:10px; display:flex; justify-content:center; }
+  .dz-icon svg{ width:34px; height:34px; stroke:var(--navy); opacity:.55; }
+  .dropzone:hover .dz-icon svg, .dropzone.drag .dz-icon svg{ opacity:.85; stroke:var(--gold); }
+  .dz-main{ font-size:.9rem; font-weight:600; }
+  .dz-sub{ font-size:.78rem; opacity:.55; margin-top:3px; }
   #fileInput{ display:none; }
-  #picked{ font-size:.85rem; opacity:.7; }
+
+  .picked{
+    display:none; align-items:center; gap:10px; margin-top:14px; padding:10px 12px;
+    background:#fcfbf8; border:1px solid var(--line); border-radius:10px; font-size:.85rem;
+  }
+  .picked.show{ display:flex; }
+  .picked .name{ flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+  .picked .size{ opacity:.55; font-size:.78rem; flex-shrink:0; }
+  .picked .clear{
+    background:none; border:none; cursor:pointer; opacity:.45; font-size:1rem; line-height:1;
+    padding:2px 4px; flex-shrink:0; color:var(--navy);
+  }
+  .picked .clear:hover{ opacity:.85; }
+
+  .progress-wrap{ display:none; margin-top:16px; }
+  .progress-wrap.show{ display:block; }
+  .progress-track{ height:8px; background:var(--line); border-radius:99px; overflow:hidden; }
+  .progress-fill{
+    height:100%; width:0%; background:linear-gradient(90deg, var(--gold), var(--gold-2));
+    border-radius:99px; transition:width .15s ease;
+  }
+  .progress-pct{ font-size:.78rem; opacity:.6; margin-top:6px; text-align:right; }
+
+  button.primary{
+    font-family:inherit; font-weight:700; font-size:.95rem; padding:14px 20px; border-radius:12px;
+    border:none; background:var(--navy); color:var(--cream); cursor:pointer; width:100%; margin-top:18px;
+    transition:transform .1s ease, background .2s ease, opacity .15s ease;
+  }
+  button.primary:hover:not(:disabled){ background:var(--navy-2); }
+  button.primary:active:not(:disabled){ transform:scale(.98); }
+  button.primary:disabled{ opacity:.5; cursor:not-allowed; }
+
+  #status{
+    font-size:.85rem; margin-top:14px; min-height:1.3em; text-align:center; font-weight:600;
+  }
+  #status.ok{ color:var(--ok); }
+  #status.err{ color:var(--danger); }
+  #status.info{ color:var(--navy); opacity:.65; font-weight:500; }
+
   .hidden{ display:none !important; }
+
+  @media (max-width:480px){
+    .card{ padding:26px 20px; border-radius:16px; }
+  }
 </style>
 </head>
 <body>
-  <h1>Secure Upload</h1>
-  <input id="apiKey" type="password" placeholder="API key" autocomplete="off">
-  <div id="picked"></div>
-  <button id="pickBtn" class="gold">Choose File</button>
-  <button id="sendBtn" class="hidden">Upload</button>
-  <div id="status"></div>
-  <input type="file" id="fileInput">
+  <div class="card">
+    <div class="brand">
+      <div class="brand-dot"></div>
+      <div>
+        <h1>Secure Upload</h1>
+        <p class="sub">Authenticated, single-endpoint transfer</p>
+      </div>
+    </div>
+
+    <label class="field-label" for="apiKey">API key or password</label>
+    <div class="key-row">
+      <input id="apiKey" type="password" placeholder="API key or password" autocomplete="off" spellcheck="false">
+      <button type="button" class="key-toggle" id="keyToggle" aria-label="Show key">show</button>
+    </div>
+
+    <label class="field-label">File</label>
+    <div class="dropzone" id="dropzone">
+      <div class="dz-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 16V4"/>
+          <path d="M7 9l5-5 5 5"/>
+          <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
+        </svg>
+      </div>
+      <div class="dz-main">Tap to choose, or drag a file here</div>
+      <div class="dz-sub">Up to 200&nbsp;MB</div>
+    </div>
+    <input type="file" id="fileInput">
+
+    <div class="picked" id="picked">
+      <span class="name" id="pickedName"></span>
+      <span class="size" id="pickedSize"></span>
+      <button type="button" class="clear" id="pickedClear" aria-label="Remove file">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="progress-pct" id="progressPct">0%</div>
+    </div>
+
+    <button type="button" class="primary" id="sendBtn" disabled>Upload</button>
+    <div id="status"></div>
+  </div>
 
 <script>
-  const fileInput = document.getElementById('fileInput');
-  const pickBtn   = document.getElementById('pickBtn');
-  const sendBtn   = document.getElementById('sendBtn');
-  const status    = document.getElementById('status');
-  const picked    = document.getElementById('picked');
-  const apiKey    = document.getElementById('apiKey');
+  const fileInput    = document.getElementById('fileInput');
+  const dropzone     = document.getElementById('dropzone');
+  const sendBtn      = document.getElementById('sendBtn');
+  const statusEl     = document.getElementById('status');
+  const apiKey       = document.getElementById('apiKey');
+  const keyToggle    = document.getElementById('keyToggle');
+  const picked       = document.getElementById('picked');
+  const pickedName   = document.getElementById('pickedName');
+  const pickedSize   = document.getElementById('pickedSize');
+  const pickedClear  = document.getElementById('pickedClear');
+  const progressWrap = document.getElementById('progressWrap');
+  const progressFill = document.getElementById('progressFill');
+  const progressPct  = document.getElementById('progressPct');
 
-  function openPicker(){ fileInput.click(); }
+  function fmtSize(bytes){
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+    return (bytes/1024/1024).toFixed(1) + ' MB';
+  }
 
-  // Browsers generally block auto-opening the picker without a real click;
-  // the gold button (always visible) is the fallback either way.
-  window.addEventListener('load', () => {
-    try { openPicker(); } catch (e) { /* fallback button stays visible */ }
+  function setStatus(msg, kind){
+    statusEl.textContent = msg || '';
+    statusEl.className = kind || '';
+  }
+
+  function updateSendState(){
+    sendBtn.disabled = !(fileInput.files.length && apiKey.value);
+  }
+
+  keyToggle.addEventListener('click', () => {
+    const showing = apiKey.type === 'text';
+    apiKey.type = showing ? 'password' : 'text';
+    keyToggle.textContent = showing ? 'show' : 'hide';
   });
+  apiKey.addEventListener('input', updateSendState);
 
-  pickBtn.addEventListener('click', openPicker);
+  dropzone.addEventListener('click', () => fileInput.click());
+
+  ['dragenter','dragover'].forEach(evt => {
+    dropzone.addEventListener(evt, e => {
+      e.preventDefault(); e.stopPropagation();
+      dropzone.classList.add('drag');
+    });
+  });
+  ['dragleave','drop'].forEach(evt => {
+    dropzone.addEventListener(evt, e => {
+      e.preventDefault(); e.stopPropagation();
+      dropzone.classList.remove('drag');
+    });
+  });
+  dropzone.addEventListener('drop', e => {
+    const dt = e.dataTransfer;
+    if (dt && dt.files && dt.files.length){
+      fileInput.files = dt.files;
+      fileInput.dispatchEvent(new Event('change'));
+    }
+  });
 
   fileInput.addEventListener('change', () => {
     if (fileInput.files.length){
-      picked.textContent = fileInput.files[0].name;
-      sendBtn.classList.remove('hidden');
+      const f = fileInput.files[0];
+      pickedName.textContent = f.name;
+      pickedSize.textContent = fmtSize(f.size);
+      picked.classList.add('show');
+    } else {
+      picked.classList.remove('show');
     }
+    updateSendState();
   });
 
+  pickedClear.addEventListener('click', (e) => {
+    e.stopPropagation();
+    fileInput.value = '';
+    picked.classList.remove('show');
+    updateSendState();
+  });
+
+  function xhrUpload(url, headers, formData){
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable){
+          const pct = Math.round((e.loaded / e.total) * 100);
+          progressFill.style.width = pct + '%';
+          progressPct.textContent = pct + '%';
+        }
+      });
+      xhr.addEventListener('load', () => resolve(xhr));
+      xhr.addEventListener('error', () => reject(new Error('network error')));
+      xhr.addEventListener('timeout', () => reject(new Error('timed out')));
+      xhr.send(formData);
+    });
+  }
+
   sendBtn.addEventListener('click', async () => {
-    if (!fileInput.files.length){ status.textContent = 'Choose a file first.'; return; }
-    if (!apiKey.value){ status.textContent = 'Enter API key.'; return; }
-    status.textContent = 'Uploading...';
+    if (!fileInput.files.length){ setStatus('Choose a file first.', 'err'); return; }
+    if (!apiKey.value){ setStatus('Enter your API key.', 'err'); return; }
+
     sendBtn.disabled = true;
+    progressWrap.classList.add('show');
+    progressFill.style.width = '0%';
+    progressPct.textContent = '0%';
+    setStatus('Preparing upload...', 'info');
+
     try{
-      // 1. get a one-time nonce
-      const nonceRes = await fetch('/nonce', { cache: 'no-store' });
-      if (!nonceRes.ok) throw new Error('nonce');
-      const { nonce } = await nonceRes.json();
-
-      // 2. prove knowledge of the key WITHOUT sending the key itself:
-      //    HMAC-SHA256(rawKey, nonce), computed entirely in the browser.
-      const enc = new TextEncoder();
-      const cryptoKey = await crypto.subtle.importKey(
-        'raw', enc.encode(apiKey.value), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-      );
-      const sigBuf = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(nonce));
-      const authToken = Array.from(new Uint8Array(sigBuf))
-        .map(b => b.toString(16).padStart(2, '0')).join('');
-
-      // 3. send only the nonce + proof -- the raw key never touches the network
       const fd = new FormData();
       fd.append('file', fileInput.files[0]);
-      const res = await fetch('/upload', {
-        method: 'POST',
-        headers: { 'X-Nonce': nonce, 'X-Auth-Token': authToken },
-        body: fd
-      });
-      status.textContent = res.ok ? 'Uploaded.' : 'Failed (check key / file).';
+
+      const hasSubtle = window.isSecureContext && window.crypto && window.crypto.subtle;
+      let headers;
+
+      if (hasSubtle) {
+        setStatus('Authenticating...', 'info');
+        const nonceRes = await fetch('/nonce', { cache: 'no-store' });
+        if (!nonceRes.ok) throw new Error('nonce request failed: ' + nonceRes.status);
+        const { nonce } = await nonceRes.json();
+
+        const enc = new TextEncoder();
+        const cryptoKey = await crypto.subtle.importKey(
+          'raw', enc.encode(apiKey.value), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+        );
+        const sigBuf = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(nonce));
+        const authToken = Array.from(new Uint8Array(sigBuf))
+          .map(b => b.toString(16).padStart(2, '0')).join('');
+
+        headers = { 'X-Nonce': nonce, 'X-Auth-Token': authToken };
+      } else {
+        // Insecure context (plain http:// on a LAN IP, etc): crypto.subtle is
+        // unavailable outside secure contexts. Fall back to the same plain
+        // X-API-Key header curl already uses.
+        headers = { 'X-API-Key': apiKey.value };
+      }
+
+      setStatus('Uploading...', 'info');
+      const xhr = await xhrUpload('/upload', headers, fd);
+
+      if (xhr.status >= 200 && xhr.status < 300){
+        setStatus('Uploaded successfully.', 'ok');
+        progressFill.style.width = '100%';
+        progressPct.textContent = '100%';
+      } else {
+        setStatus('Failed: HTTP ' + xhr.status + ' (check key or file).', 'err');
+      }
     } catch(e){
-      status.textContent = 'Network error.';
+      setStatus('Error: ' + (e && e.message ? e.message : 'request failed'), 'err');
     }
     sendBtn.disabled = false;
+    updateSendState();
   });
 </script>
 </body>
@@ -237,6 +481,48 @@ def save_config(data):
 
 def sha256_hex(s: bytes) -> str:
     return hashlib.sha256(s).hexdigest()
+
+
+_PBKDF2_ITERATIONS = 310_000  # OWASP-recommended floor for PBKDF2-HMAC-SHA256 (2023+)
+
+
+def pbkdf2_hash(password: bytes, salt: bytes) -> str:
+    """Slow, salted hash for the human-typable password specifically.
+    API keys are already high-entropy (128+ bits from HMAC-SHA256 output),
+    so a fast SHA-256 hash of one is fine -- brute-forcing the hash is
+    infeasible regardless of hash speed. A password is not: it depends on
+    what the user chose, so if pyu_config.json is ever leaked, the hash
+    itself must be slow to make offline guessing impractical."""
+    dk = hashlib.pbkdf2_hmac("sha256", password, salt, _PBKDF2_ITERATIONS)
+    return dk.hex()
+
+
+def verify_password_hash(password: bytes, salt_hex: str, stored_hash_hex: str) -> bool:
+    salt = bytes.fromhex(salt_hex)
+    computed = pbkdf2_hash(password, salt)
+    return hmac.compare_digest(computed, stored_hash_hex)
+
+
+# Common/trivially-weak passwords rejected outright regardless of length.
+_COMMON_WEAK_PASSWORDS = {
+    "password", "password1", "12345678", "123456789", "1234567890",
+    "qwertyui", "letmein1", "admin123", "welcome1", "changeme",
+    "iloveyou", "password123", "qwerty123", "abc12345",
+}
+
+
+def password_strength_issue(pw: str) -> str:
+    """Returns a human-readable reason the password is too weak, or ''
+    if it passes. Checked at set time only -- never logged or stored."""
+    if len(pw) < 12:
+        return "must be at least 12 characters"
+    if pw.lower() in _COMMON_WEAK_PASSWORDS:
+        return "too common -- pick something less guessable"
+    if pw.isdigit():
+        return "can't be all digits"
+    if len(set(pw)) <= 3:
+        return "too repetitive -- use a wider mix of characters"
+    return ""
 
 
 def _keystream(server_secret: bytes, salt: bytes, length: int) -> bytes:
@@ -335,6 +621,56 @@ def add_new_key(data=None):
     print("=== configure this in your trusted client, then discard this terminal output ===\n")
 
 
+def set_password(data=None):
+    """Set/replace a human-typable password. Stored differently from API
+    keys: verification uses a slow, salted PBKDF2 hash (pw_hash/pw_salt)
+    instead of fast SHA-256, since a password's security depends on what
+    the user chose rather than raw entropy -- if pyu_config.json ever
+    leaks, a slow hash makes offline guessing far less practical. Still
+    keeps an encrypted copy (salt/enc) for the browser's HMAC challenge,
+    same as keys."""
+    if data is None:
+        data = load_config()
+        if data is None:
+            print("No pyu_config.json found. Run with -i first.")
+            sys.exit(1)
+
+    import getpass
+    while True:
+        pw1 = getpass.getpass("New password (min 12 chars): ")
+        issue = password_strength_issue(pw1)
+        if issue:
+            print(f"Password rejected: {issue}. Try again.")
+            continue
+        pw2 = getpass.getpass("Confirm password: ")
+        if pw1 != pw2:
+            print("Passwords didn't match. Try again.")
+            continue
+        break
+
+    server_secret = base64.b64decode(data["server_secret_b64"])
+    salt_b64, enc_b64 = encrypt_for_storage(pw1.encode(), server_secret)
+
+    pw_salt = os.urandom(16)
+    pw_hash = pbkdf2_hash(pw1.encode(), pw_salt)
+
+    # remove any existing password entry, then add the new one
+    data["keys"] = [k for k in data["keys"] if not k.get("is_password")]
+    entry = {
+        "id": secrets.token_hex(4),
+        "pw_hash": pw_hash,
+        "pw_salt": pw_salt.hex(),
+        "salt": salt_b64,
+        "enc": enc_b64,
+        "created": int(_now()),
+        "is_password": True,
+    }
+    data["keys"].append(entry)
+    save_config(data)
+    print("\nPassword set. It can now be used in place of an API key on the web upload page.")
+    print(f"key id: {entry['id']} (revoke with -r {entry['id']} same as any key)\n")
+
+
 def revoke_key(key_id):
     data = load_config()
     if not data:
@@ -349,10 +685,15 @@ def revoke_key(key_id):
 def verify_key(presented: str, data) -> bool:
     if not presented or not data:
         return False
-    presented_hash = sha256_hex(presented.encode())
+    presented_bytes = presented.encode()
+    presented_hash = sha256_hex(presented_bytes)
     ok = False
     for entry in data["keys"]:
-        if hmac.compare_digest(entry["hash"], presented_hash):
+        if entry.get("is_password"):
+            if "pw_hash" in entry and "pw_salt" in entry:
+                if verify_password_hash(presented_bytes, entry["pw_salt"], entry["pw_hash"]):
+                    ok = True
+        elif hmac.compare_digest(entry.get("hash", ""), presented_hash):
             ok = True
     return ok
 
@@ -370,26 +711,29 @@ def verify_key(presented: str, data) -> bool:
 # use, not a browser sending credentials over a network you don't control).
 # ---------------------------------------------------------------------------
 _nonce_store = {}   # nonce -> expiry_timestamp
+_nonce_lock = threading.Lock()
 _NONCE_TTL = 60      # seconds
 _NONCE_MAX = 500     # hard cap so a nonce-request flood can't grow memory unbounded
 
 
 def issue_nonce() -> str:
     now = _now()
-    # opportunistic cleanup of expired nonces so the dict doesn't grow forever
-    for n in [n for n, exp in _nonce_store.items() if exp < now]:
-        _nonce_store.pop(n, None)
-    if len(_nonce_store) >= _NONCE_MAX:
-        # drop the oldest-issued entries rather than let the store grow
-        for n in sorted(_nonce_store, key=_nonce_store.get)[: len(_nonce_store) - _NONCE_MAX + 1]:
+    with _nonce_lock:
+        # opportunistic cleanup of expired nonces so the dict doesn't grow forever
+        for n in [n for n, exp in _nonce_store.items() if exp < now]:
             _nonce_store.pop(n, None)
-    nonce = secrets.token_urlsafe(24)
-    _nonce_store[nonce] = now + _NONCE_TTL
-    return nonce
+        if len(_nonce_store) >= _NONCE_MAX:
+            # drop the oldest-issued entries rather than let the store grow
+            for n in sorted(_nonce_store, key=_nonce_store.get)[: len(_nonce_store) - _NONCE_MAX + 1]:
+                _nonce_store.pop(n, None)
+        nonce = secrets.token_urlsafe(24)
+        _nonce_store[nonce] = now + _NONCE_TTL
+        return nonce
 
 
 def consume_nonce(nonce: str) -> bool:
-    exp = _nonce_store.pop(nonce, None)
+    with _nonce_lock:
+        exp = _nonce_store.pop(nonce, None)
     return exp is not None and exp >= _now()
 
 
@@ -415,10 +759,34 @@ def verify_challenge(nonce: str, token_hex: str, data) -> bool:
 def rate_limited(ip: str) -> bool:
     now = _now()
     window_start = now - RATE_LIMIT_WINDOW
-    hits = [t for t in _rate_state.get(ip, []) if t > window_start]
-    hits.append(now)
-    _rate_state[ip] = hits
-    return len(hits) > RATE_LIMIT_MAX
+    with _rate_lock:
+        hits = [t for t in _rate_state.get(ip, []) if t > window_start]
+        hits.append(now)
+        _rate_state[ip] = hits
+        return len(hits) > RATE_LIMIT_MAX
+
+
+_AUTH_FAIL_WINDOW = 60     # seconds
+_AUTH_FAIL_MAX = 5         # max failed-auth attempts per IP per window (tightened
+                           # now that a lower-entropy password credential can exist)
+
+
+def auth_fail_limited(ip: str) -> bool:
+    """Stricter limit specifically on failed-auth attempts, separate from the
+    general request rate limit -- slows down key-guessing / brute force."""
+    now = _now()
+    window_start = now - _AUTH_FAIL_WINDOW
+    with _auth_fail_lock:
+        hits = [t for t in _auth_fail_state.get(ip, []) if t > window_start]
+        return len(hits) >= _AUTH_FAIL_MAX
+
+
+def record_auth_failure(ip: str):
+    now = _now()
+    with _auth_fail_lock:
+        hits = [t for t in _auth_fail_state.get(ip, []) if t > now - _AUTH_FAIL_WINDOW]
+        hits.append(now)
+        _auth_fail_state[ip] = hits
 
 
 def safe_filename(original: str) -> str:
@@ -447,7 +815,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'")
 
     def _deny(self, code=404):
         body = b'{"error":"not found"}'
@@ -563,6 +931,11 @@ class Handler(BaseHTTPRequestHandler):
             self._deny(404)
             return
 
+        if auth_fail_limited(client_ip):
+            time.sleep(0.5)
+            self._deny(429)
+            return
+
         api_key = self.headers.get("X-API-Key", "")
         nonce = self.headers.get("X-Nonce", "")
         auth_token = self.headers.get("X-Auth-Token", "")
@@ -575,6 +948,7 @@ class Handler(BaseHTTPRequestHandler):
             authed = verify_key(api_key, data)
 
         if not authed:
+            record_auth_failure(client_ip)
             time.sleep(0.3)
             self._deny(404)
             return
@@ -591,17 +965,12 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             body = self.rfile.read(length)
-            fs = cgi.FieldStorage(
-                fp=io.BytesIO(body), headers=self.headers,
-                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
-            )
-            file_field = None
-            for key in fs.keys():
-                item = fs[key]
-                if getattr(item, "filename", None):
-                    file_field = item
-                    break
-            if file_field is None or not file_field.file:
+            result = parse_multipart_file(body, content_type)
+            if result is None:
+                self._deny(400)
+                return
+            filename, file_bytes = result
+            if not filename:
                 self._deny(400)
                 return
 
@@ -611,10 +980,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            fname = safe_filename(file_field.filename)
+            fname = safe_filename(filename)
             dest = os.path.join(UPLOAD_DIR, fname)
             with open(dest, "wb") as out:
-                out.write(file_field.file.read())
+                out.write(file_bytes)
             os.chmod(dest, 0o600)
 
             self.log_message("upload ok from %s -> %s", client_ip, fname)
@@ -664,6 +1033,13 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, **kw)
 
 
+def _run_ok(cmd, **kw) -> bool:
+    """Like _run, but returns True/False based on the exit code, so callers
+    can't silently sail past a failed step."""
+    r = _run(cmd, **kw)
+    return r.returncode == 0
+
+
 def detect_pkg_manager():
     if shutil.which("pkg") and "com.termux" in os.environ.get("PREFIX", ""):
         return "termux"
@@ -700,16 +1076,25 @@ def install_cloudflared():
 
     if mgr == "dnf":
         _run(["sudo", "dnf", "install", "-y", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-x86_64.rpm"])
-        return bool(shutil.which("cloudflared"))
+        if not shutil.which("cloudflared"):
+            print("dnf install did not result in a `cloudflared` binary on PATH.")
+            return False
+        return True
 
     if mgr == "apt":
         arch = platform.machine()
         deb_arch = "amd64" if "x86_64" in arch else ("arm64" if "aarch64" in arch or "arm" in arch else "amd64")
         deb_url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{deb_arch}.deb"
         deb_path = "/tmp/cloudflared.deb"
-        _run(["curl", "-fsSL", "-o", deb_path, deb_url])
+        if not _run_ok(["curl", "-fsSL", "-o", deb_path, deb_url]):
+            print(f"Could not download {deb_url}. Check your network connection.")
+            return False
         _run(["sudo", "dpkg", "-i", deb_path])
-        return bool(shutil.which("cloudflared"))
+        if not shutil.which("cloudflared"):
+            print("dpkg install did not result in a `cloudflared` binary on PATH.")
+            print("Try: sudo apt-get install -f   (to resolve missing dependencies)")
+            return False
+        return True
 
     print("Unknown OS/package manager. Install cloudflared manually:")
     print("  https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/")
@@ -748,7 +1133,11 @@ def register_service_systemd(config_yml):
         print("`cloudflared service install` failed. You can retry manually:")
         print(f"  sudo cloudflared --config {config_yml} service install")
         return False
-    _run(maybe_sudo(["systemctl", "enable", "--now", "cloudflared"]))
+    if not _run_ok(maybe_sudo(["systemctl", "enable", "--now", "cloudflared"])):
+        print("`systemctl enable --now cloudflared` failed. Check with:")
+        print("  sudo systemctl status cloudflared")
+        print("  sudo journalctl -u cloudflared -e")
+        return False
     print("Service 'cloudflared' enabled and started via systemd.")
     print("Check status with:  systemctl status cloudflared")
     print("Check logs with:    journalctl -u cloudflared -f")
@@ -759,7 +1148,13 @@ def register_service_termux(config_yml):
     """Termux has no systemd; it uses runit via the termux-services package."""
     if not shutil.which("sv-enable"):
         print("Installing termux-services (provides runit-based service management)...")
-        _run(["pkg", "install", "-y", "termux-services"])
+        if not _run_ok(["pkg", "install", "-y", "termux-services"]):
+            print("Could not install termux-services. Falling back to a plain")
+            print("background process (won't survive a reboot or crash-restart).")
+        elif not shutil.which("sv-enable"):
+            print("termux-services installed but sv-enable still not on PATH.")
+            print("You may need to restart your Termux session, then re-run -c.")
+            print("Falling back to a plain background process for now.")
 
     prefix = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
     svdir = os.path.join(prefix, "var", "service", "cloudflared")
@@ -773,8 +1168,11 @@ def register_service_termux(config_yml):
     os.chmod(run_script, 0o755)
 
     if shutil.which("sv-enable"):
-        _run(["sv-enable", "cloudflared"])
-        _run(["sv", "up", "cloudflared"])
+        enable_ok = _run_ok(["sv-enable", "cloudflared"])
+        up_ok = _run_ok(["sv", "up", "cloudflared"])
+        if not (enable_ok and up_ok):
+            print("sv-enable/sv up reported an error. Check with: sv status cloudflared")
+            return False
         print("Service 'cloudflared' registered and started via termux-services (runit).")
         print("Check status with:  sv status cloudflared")
         print("Restart with:       sv restart cloudflared")
@@ -785,11 +1183,15 @@ def register_service_termux(config_yml):
 
     print("termux-services unavailable; falling back to a plain background process.")
     log_path = os.path.join(SCRIPT_DIR, "cloudflared.log")
-    with open(log_path, "a") as logf:
-        subprocess.Popen(
-            ["cloudflared", "--config", config_yml, "tunnel", "run", TUNNEL_NAME],
-            stdout=logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True,
-        )
+    try:
+        with open(log_path, "a") as logf:
+            subprocess.Popen(
+                ["cloudflared", "--config", config_yml, "tunnel", "run", TUNNEL_NAME],
+                stdout=logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True,
+            )
+    except Exception as e:
+        print(f"Could not start cloudflared in the background: {e}")
+        return False
     print(f"Started detached, logs -> {log_path} (will not survive a reboot).")
     return True
 
@@ -802,11 +1204,15 @@ def register_cloudflared_service(config_yml):
     print("No systemd and not Termux: starting cloudflared as a plain background")
     print("process instead (won't auto-restart on reboot).")
     log_path = os.path.join(SCRIPT_DIR, "cloudflared.log")
-    with open(log_path, "a") as logf:
-        subprocess.Popen(
-            ["cloudflared", "--config", config_yml, "tunnel", "run", TUNNEL_NAME],
-            stdout=logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True,
-        )
+    try:
+        with open(log_path, "a") as logf:
+            subprocess.Popen(
+                ["cloudflared", "--config", config_yml, "tunnel", "run", TUNNEL_NAME],
+                stdout=logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True,
+            )
+    except Exception as e:
+        print(f"Could not start cloudflared in the background: {e}")
+        return False
     print(f"Started detached, logs -> {log_path}")
     return True
 
@@ -821,6 +1227,9 @@ def cloudflare_setup(port):
     subdomain = data.get("subdomain", "")
     if not domain:
         domain = input("Your domain (e.g. example.com): ").strip()
+    if not domain:
+        print("A domain is required to route DNS. Aborting.")
+        sys.exit(1)
     if not subdomain:
         sub_in = input("Subdomain to use [enter for random 4-char]: ").strip()
         subdomain = sub_in if sub_in else gen_subdomain(4)
@@ -838,8 +1247,9 @@ def cloudflare_setup(port):
 
     etc_dir = etc_cloudflared_dir()
     print(f"cloudflared config directory: {etc_dir}")
-    mk = maybe_sudo(["mkdir", "-p", etc_dir])
-    _run(mk)
+    if not _run_ok(maybe_sudo(["mkdir", "-p", etc_dir])):
+        print(f"Could not create {etc_dir}. Check permissions and retry. Aborting.")
+        sys.exit(1)
     if not is_termux() and os.geteuid() != 0:
         _run(["sudo", "chown", "-R", os.environ.get("USER", "root"), etc_dir])
 
@@ -850,45 +1260,68 @@ def cloudflare_setup(port):
     env = os.environ.copy()
     env["TUNNEL_ORIGIN_CERT"] = cert_path
 
-    # 1) Authorize (opens a browser link; user approves in the Cloudflare dashboard)
-    print("\nStep 1/5: authorize with Cloudflare (approve the link that opens/prints below)...")
-    _run(["cloudflared", "tunnel", "--origincert", cert_path, "login"], env=env)
-    if not os.path.exists(cert_path):
-        print("Authorization did not complete (no cert.pem found). Aborting.")
-        sys.exit(1)
+    # 1) Authorize (opens a browser link; user approves in the Cloudflare dashboard).
+    # Skip re-auth if we already have a valid cert from a previous run.
+    if os.path.exists(cert_path):
+        print("Step 1/5: existing cert.pem found, skipping re-authorization.")
+    else:
+        print("\nStep 1/5: authorize with Cloudflare (approve the link that opens/prints below)...")
+        _run(["cloudflared", "tunnel", "--origincert", cert_path, "login"], env=env)
+        if not os.path.exists(cert_path):
+            print("Authorization did not complete (no cert.pem found). Aborting.")
+            sys.exit(1)
 
-    # 2) Create the tunnel (safe to re-run; cloudflared errors harmlessly if it exists)
+    # 2) Create the tunnel. `cloudflared tunnel create` exits non-zero if a
+    # tunnel with this name already exists -- that's expected on a re-run,
+    # not a failure, as long as we can still find its credentials file.
     print("Step 2/5: creating tunnel...")
-    _run(["cloudflared", "tunnel", "--origincert", cert_path,
-          "--credentials-file", creds_path,
-          "create", TUNNEL_NAME], env=env)
+    create_result = _run(["cloudflared", "tunnel", "--origincert", cert_path,
+                           "--credentials-file", creds_path,
+                           "create", TUNNEL_NAME], env=env)
+    tunnel_already_existed = create_result.returncode != 0
 
     if not os.path.exists(creds_path):
-        # fall back to wherever cloudflared actually put it (~/.cloudflared)
+        # fall back to wherever cloudflared actually put it (~/.cloudflared),
+        # covering both the "already existed" case and any path mismatch.
         default_dir = os.path.expanduser("~/.cloudflared")
         found = None
         if os.path.exists(default_dir):
-            for fname in os.listdir(default_dir):
-                if fname.endswith(".json"):
-                    found = os.path.join(default_dir, fname)
+            candidates = [f for f in os.listdir(default_dir) if f.endswith(".json") and f != "cert.pem"]
+            if candidates:
+                # newest credentials file, in case there are several tunnels
+                candidates.sort(key=lambda f: os.path.getmtime(os.path.join(default_dir, f)), reverse=True)
+                found = os.path.join(default_dir, candidates[0])
         if not found:
-            print("Could not locate tunnel credentials file. Aborting.")
+            if tunnel_already_existed:
+                print(f"Tunnel '{TUNNEL_NAME}' already exists, but its credentials file")
+                print("could not be located automatically. If you know where it lives,")
+                print(f"copy it to {creds_path} and re-run. Otherwise delete the tunnel")
+                print(f"first (cloudflared tunnel delete {TUNNEL_NAME}) and re-run this wizard.")
+            else:
+                print("Could not locate tunnel credentials file after creation. Aborting.")
             sys.exit(1)
-        _run(maybe_sudo(["cp", found, creds_path]))
+        if not _run_ok(maybe_sudo(["cp", found, creds_path])):
+            print(f"Could not copy credentials into {creds_path}. Aborting.")
+            sys.exit(1)
 
-    tunnel_id = os.path.splitext(os.path.basename(creds_path))[0].replace(f"{TUNNEL_NAME}-creds", "")
-    if not tunnel_id:
-        # credentials file itself contains the TunnelID field; read it
-        try:
-            with open(creds_path) as f:
-                tunnel_id = json.load(f).get("TunnelID", "")
-        except Exception:
-            tunnel_id = ""
+    tunnel_id = ""
+    try:
+        with open(creds_path) as f:
+            tunnel_id = json.load(f).get("TunnelID", "")
+    except Exception:
+        pass
 
-    # 3) Route DNS: point hostname -> tunnel
+    # 3) Route DNS: point hostname -> tunnel. Also idempotent-ish: cloudflared
+    # errors if the exact record already points here, which is fine -- but a
+    # genuine conflict (record exists pointing elsewhere) needs a human to see it.
     print("Step 3/5: creating DNS record...")
-    _run(["cloudflared", "tunnel", "--origincert", cert_path,
-          "route", "dns", TUNNEL_NAME, hostname], env=env)
+    dns_result = _run(["cloudflared", "tunnel", "--origincert", cert_path,
+                        "route", "dns", TUNNEL_NAME, hostname], env=env)
+    if dns_result.returncode != 0:
+        print(f"\nWarning: DNS route step reported an error for '{hostname}'.")
+        print("This is often harmless on a re-run (record already correct), but if")
+        print(f"'{hostname}' doesn't resolve after this finishes, check the Cloudflare")
+        print("DNS dashboard for a conflicting record and remove it, then re-run -c.\n")
 
     # 4) Write cloudflared config.yml in the standard /etc location
     print("Step 4/5: writing cloudflared config to standard location...")
@@ -904,7 +1337,9 @@ def cloudflare_setup(port):
     tmp_cfg = os.path.join(SCRIPT_DIR, ".config_yml.tmp")
     with open(tmp_cfg, "w") as f:
         f.write(config_body)
-    _run(maybe_sudo(["mv", tmp_cfg, config_yml]))
+    if not _run_ok(maybe_sudo(["mv", tmp_cfg, config_yml])):
+        print(f"Could not write {config_yml}. Check permissions. Aborting.")
+        sys.exit(1)
     print(f"Wrote {config_yml}")
 
     # keep a copy of key paths in pyu_config.json for reference
@@ -914,9 +1349,14 @@ def cloudflare_setup(port):
 
     # 5) Register + start as a real service (systemd or Termux runit)
     print("Step 5/5: registering cloudflared as a background service...")
-    register_cloudflared_service(config_yml)
+    service_ok = register_cloudflared_service(config_yml)
 
-    print(f"\nDone. Your endpoint should be reachable at: https://{hostname}/")
+    if service_ok:
+        print(f"\nDone. Your endpoint should be reachable at: https://{hostname}/")
+    else:
+        print(f"\nTunnel and DNS are configured for https://{hostname}/, but the")
+        print("background service registration reported a problem above -- fix that")
+        print("and start cloudflared manually, or re-run this wizard once it's resolved.")
     print(f"Now start pyu itself, e.g.:  python3 pyu.py -d -p {port}")
 
 
@@ -928,8 +1368,9 @@ if __name__ == "__main__":
     ap.add_argument("-i", action="store_true", help="init: create config + first API key")
     ap.add_argument("-f", action="store_true", help="with -i, force-wipe existing config")
     ap.add_argument("-k", action="store_true", help="issue an additional API key")
+    ap.add_argument("-w", action="store_true", help="set/replace the web-page password")
     ap.add_argument("-r", metavar="KEY_ID", help="revoke a key by its id")
-    ap.add_argument("-p", type=int, default=PORT, help="listen port (default 820)")
+    ap.add_argument("-p", type=int, default=PORT, help="listen port (default 8820)")
     ap.add_argument("-d", action="store_true", help="daemonize: run detached in background")
     ap.add_argument("-c", action="store_true", help="Cloudflare wizard: install, auth, tunnel, DNS, config, start")
     args = ap.parse_args()
@@ -938,6 +1379,8 @@ if __name__ == "__main__":
         init_config(force=args.f)
     elif args.k:
         add_new_key()
+    elif args.w:
+        set_password()
     elif args.r:
         revoke_key(args.r)
     elif args.c:
