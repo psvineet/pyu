@@ -60,6 +60,15 @@ CLIENT SIDE
          -H "X-API-Key: <your-key>" \\
          -F "file=@/path/to/file"
 
+    Multiple files in one request (repeat -F "file=@...", same field name):
+    curl -X POST https://<sub>.<domain>/upload \\
+         -H "X-API-Key: <your-key>" \\
+         -F "file=@/path/one.jpg" -F "file=@/path/two.pdf" -F "file=@/path/three.zip"
+
+    All files in a directory (bash):
+    curl -X POST https://<sub>.<domain>/upload -H "X-API-Key: <your-key>" \\
+         $(for f in /path/to/dir/*; do printf ' -F file=@%q' "$f"; done)
+
 API KEY DERIVATION
 -------------------
     raw_key = "ep_" + base64url(HMAC-SHA256(server_secret, "issue:" + uuid4 + ":" + ts)) + extra
@@ -91,17 +100,32 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # ---------------------------------------------------------------------------
 PORT = 8820
 HOST = "0.0.0.0"
-UPLOAD_DIR = "/storage/emulated/0/Android/endpoint"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "pyu_config.json")   # secrets + domain
 # cloudflared's own config/creds/cert now live in the standard /etc location
 # (or Termux's $PREFIX/etc equivalent) -- see etc_cloudflared_dir() below.
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024   # 200 MB hard cap, tune as needed
+MAX_FILES_PER_UPLOAD = 20              # cap on files accepted in a single multi-file request
 ALLOWED_PATH = "/upload"               # the ONLY POST route that exists
 RATE_LIMIT_WINDOW = 10                 # seconds
 RATE_LIMIT_MAX = 20                    # max requests per IP per window
 TUNNEL_NAME = "pyu-tunnel"
 # ---------------------------------------------------------------------------
+
+
+def _default_upload_dir() -> str:
+    """The Android/Termux path only exists (and is only writable) inside
+    Termux itself. On Arch/Fedora/Debian/regular Linux, /storage doesn't
+    exist at all and creating it fails with PermissionError -- so pick a
+    sensible default per platform instead of hardcoding the Termux path."""
+    if "com.termux" in os.environ.get("PREFIX", ""):
+        return "/storage/emulated/0/Android/endpoint"
+    return os.path.join(SCRIPT_DIR, "uploads")
+
+
+# Override by setting the PYU_UPLOAD_DIR environment variable, or by editing
+# this line directly -- either works, env var takes precedence.
+UPLOAD_DIR = os.environ.get("PYU_UPLOAD_DIR") or _default_upload_dir()
 
 _rate_state = {}  # ip -> [timestamps]
 _rate_lock = threading.Lock()
@@ -110,29 +134,66 @@ _auth_fail_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Tiny stdlib-only multipart/form-data parser (replaces removed `cgi` module,
-# gone in Py3.13+). Returns first file field as (filename, bytes) or None.
+# gone in Py3.13+). Returns every file field found, to support multi-file
+# uploads in a single request.
 # ---------------------------------------------------------------------------
-def parse_multipart_file(body: bytes, content_type: str):
+def parse_multipart_files(body: bytes, content_type: str):
+    """Tiny stdlib-only multipart/form-data parser. Locates the boundary
+    delimiter by explicit byte search rather than str.split(), because a
+    naive split() on the boundary sequence corrupts any file whose binary
+    content happens to contain those same bytes (which is common for
+    images, archives, and other binary formats at any real size) -- this
+    finds only genuine boundary lines (delimiter followed by CRLF or
+    "--" at the very end), not arbitrary occurrences inside file data.
+    Returns a list of (filename, bytes) for every file field present, in
+    the order they appear. Non-file fields are skipped. Empty list if the
+    body has no file fields or can't be parsed.
+    """
     m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type)
     if not m:
-        return None
+        return []
     boundary = (m.group(1) or m.group(2)).strip()
     delim = b"--" + boundary.encode()
 
-    parts = body.split(delim)
-    for part in parts:
-        part = part.strip(b"\r\n")
-        if not part or part == b"--":
-            continue
+    # Find every position where a genuine boundary line starts: the
+    # delimiter bytes immediately followed by CRLF (a normal part
+    # separator) or by "--" (the terminating boundary). This rejects
+    # a delimiter-shaped byte sequence appearing mid-file, since real
+    # boundary lines always sit on their own CRLF-terminated line.
+    positions = []
+    start = 0
+    dlen = len(delim)
+    while True:
+        idx = body.find(delim, start)
+        if idx == -1:
+            break
+        after = body[idx + dlen: idx + dlen + 2]
+        if after in (b"\r\n", b"--"):
+            positions.append(idx)
+        start = idx + dlen
+    if len(positions) < 2:
+        return []
+
+    files = []
+    for i in range(len(positions) - 1):
+        part_start = positions[i] + dlen
+        # skip the CRLF right after the opening boundary line
+        if body[part_start:part_start + 2] == b"\r\n":
+            part_start += 2
+        part_end = positions[i + 1]
+        part = body[part_start:part_end]
+        # strip the trailing CRLF that precedes the next boundary line
+        if part.endswith(b"\r\n"):
+            part = part[:-2]
+
         if b"\r\n\r\n" not in part:
             continue
         headers_raw, content = part.split(b"\r\n\r\n", 1)
-        content = content.rstrip(b"\r\n")
         headers_txt = headers_raw.decode(errors="replace")
         fn_match = re.search(r'filename="([^"]*)"', headers_txt)
         if fn_match and fn_match.group(1):
-            return fn_match.group(1), content
-    return None
+            files.append((fn_match.group(1), content))
+    return files
 
 # ---------------------------------------------------------------------------
 # Upload page: card layout, drag-and-drop, progress bar, responsive.
@@ -160,7 +221,7 @@ PAGE_HTML = """<!DOCTYPE html>
     font-family:'Noto Sans', sans-serif; color:var(--navy); padding:20px;
   }
   .card{
-    width:100%; max-width:440px; background:#fff; border-radius:20px;
+    width:100%; max-width:460px; background:#fff; border-radius:20px;
     box-shadow:0 20px 50px -20px rgba(11,37,69,.25), 0 2px 8px rgba(11,37,69,.06);
     padding:32px 28px; border:1px solid var(--line);
   }
@@ -207,36 +268,63 @@ PAGE_HTML = """<!DOCTYPE html>
   .dz-sub{ font-size:.78rem; opacity:.55; margin-top:3px; }
   #fileInput{ display:none; }
 
-  .picked{
-    display:none; align-items:center; gap:10px; margin-top:14px; padding:10px 12px;
+  .file-list{ margin-top:14px; display:flex; flex-direction:column; gap:8px; max-height:260px; overflow-y:auto; }
+  .file-row{
+    display:flex; align-items:center; gap:10px; padding:10px 12px;
     background:#fcfbf8; border:1px solid var(--line); border-radius:10px; font-size:.85rem;
   }
-  .picked.show{ display:flex; }
-  .picked .name{ flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
-  .picked .size{ opacity:.55; font-size:.78rem; flex-shrink:0; }
-  .picked .clear{
-    background:none; border:none; cursor:pointer; opacity:.45; font-size:1rem; line-height:1;
-    padding:2px 4px; flex-shrink:0; color:var(--navy);
-  }
-  .picked .clear:hover{ opacity:.85; }
-
-  .progress-wrap{ display:none; margin-top:16px; }
-  .progress-wrap.show{ display:block; }
-  .progress-track{ height:8px; background:var(--line); border-radius:99px; overflow:hidden; }
-  .progress-fill{
+  .file-row .ficon{ flex-shrink:0; width:18px; height:18px; opacity:.5; }
+  .file-row .ficon svg{ width:100%; height:100%; }
+  .file-row .meta{ flex:1; min-width:0; }
+  .file-row .name{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+  .file-row .sub-line{ font-size:.75rem; opacity:.55; margin-top:1px; }
+  .file-row .sub-line.err{ color:var(--danger); opacity:.9; }
+  .file-row .sub-line.ok{ color:var(--ok); opacity:.9; }
+  .file-row .row-track{ height:4px; background:var(--line); border-radius:99px; overflow:hidden; margin-top:5px; }
+  .file-row .row-fill{
     height:100%; width:0%; background:linear-gradient(90deg, var(--gold), var(--gold-2));
-    border-radius:99px; transition:width .15s ease;
+    border-radius:99px; transition:width .12s ease;
   }
-  .progress-pct{ font-size:.78rem; opacity:.6; margin-top:6px; text-align:right; }
+  .file-row.done .row-fill{ background:var(--ok); }
+  .file-row.failed .row-fill{ background:var(--danger); }
+  .file-row .remove{
+    background:none; border:none; cursor:pointer; opacity:.4; padding:4px; flex-shrink:0;
+    color:var(--navy); border-radius:6px; display:flex;
+  }
+  .file-row .remove:hover{ opacity:.85; background:rgba(11,37,69,.06); }
+  .file-row .remove svg{ width:14px; height:14px; }
+  .file-row .status-icon{ width:16px; height:16px; flex-shrink:0; display:none; }
+  .file-row .status-icon svg{ width:100%; height:100%; }
+  .file-row.done .status-icon{ display:block; }
+  .file-row.done .status-icon svg{ stroke:var(--ok); }
+  .file-row.failed .status-icon{ display:block; }
+  .file-row.failed .status-icon svg{ stroke:var(--danger); }
 
+  .btn-row{ display:flex; gap:10px; margin-top:18px; }
   button.primary{
     font-family:inherit; font-weight:700; font-size:.95rem; padding:14px 20px; border-radius:12px;
-    border:none; background:var(--navy); color:var(--cream); cursor:pointer; width:100%; margin-top:18px;
+    border:none; background:var(--navy); color:var(--cream); cursor:pointer; flex:1;
     transition:transform .1s ease, background .2s ease, opacity .15s ease;
   }
   button.primary:hover:not(:disabled){ background:var(--navy-2); }
   button.primary:active:not(:disabled){ transform:scale(.98); }
   button.primary:disabled{ opacity:.5; cursor:not-allowed; }
+  button.cancel{
+    font-family:inherit; font-weight:600; font-size:.9rem; padding:14px 18px; border-radius:12px;
+    border:1.5px solid var(--line); background:#fff; color:var(--navy); cursor:pointer;
+    display:none;
+  }
+  button.cancel.show{ display:block; }
+  button.cancel:hover{ border-color:var(--danger); color:var(--danger); }
+
+  .overall{ margin-top:14px; display:none; }
+  .overall.show{ display:block; }
+  .overall-track{ height:8px; background:var(--line); border-radius:99px; overflow:hidden; }
+  .overall-fill{
+    height:100%; width:0%; background:linear-gradient(90deg, var(--gold), var(--gold-2));
+    border-radius:99px; transition:width .15s ease;
+  }
+  .overall-label{ font-size:.78rem; opacity:.6; margin-top:6px; text-align:center; }
 
   #status{
     font-size:.85rem; margin-top:14px; min-height:1.3em; text-align:center; font-weight:600;
@@ -268,7 +356,7 @@ PAGE_HTML = """<!DOCTYPE html>
       <button type="button" class="key-toggle" id="keyToggle" aria-label="Show key">show</button>
     </div>
 
-    <label class="field-label">File</label>
+    <label class="field-label">Files</label>
     <div class="dropzone" id="dropzone">
       <div class="dz-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -277,42 +365,52 @@ PAGE_HTML = """<!DOCTYPE html>
           <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
         </svg>
       </div>
-      <div class="dz-main">Tap to choose, or drag a file here</div>
-      <div class="dz-sub">Up to 200&nbsp;MB</div>
+      <div class="dz-main">Tap to choose, or drag files here</div>
+      <div class="dz-sub">Multiple files supported, up to 200&nbsp;MB total</div>
     </div>
-    <input type="file" id="fileInput">
+    <input type="file" id="fileInput" multiple>
 
-    <div class="picked" id="picked">
-      <span class="name" id="pickedName"></span>
-      <span class="size" id="pickedSize"></span>
-      <button type="button" class="clear" id="pickedClear" aria-label="Remove file">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
-    </div>
+    <div class="file-list" id="fileList"></div>
 
-    <div class="progress-wrap" id="progressWrap">
-      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-      <div class="progress-pct" id="progressPct">0%</div>
+    <div class="overall" id="overall">
+      <div class="overall-track"><div class="overall-fill" id="overallFill"></div></div>
+      <div class="overall-label" id="overallLabel">0%</div>
     </div>
 
-    <button type="button" class="primary" id="sendBtn" disabled>Upload</button>
+    <div class="btn-row">
+      <button type="button" class="primary" id="sendBtn" disabled>Upload</button>
+      <button type="button" class="cancel" id="cancelBtn">Cancel</button>
+    </div>
     <div id="status"></div>
   </div>
 
 <script>
-  const fileInput    = document.getElementById('fileInput');
-  const dropzone     = document.getElementById('dropzone');
-  const sendBtn      = document.getElementById('sendBtn');
-  const statusEl     = document.getElementById('status');
-  const apiKey       = document.getElementById('apiKey');
-  const keyToggle    = document.getElementById('keyToggle');
-  const picked       = document.getElementById('picked');
-  const pickedName   = document.getElementById('pickedName');
-  const pickedSize   = document.getElementById('pickedSize');
-  const pickedClear  = document.getElementById('pickedClear');
-  const progressWrap = document.getElementById('progressWrap');
-  const progressFill = document.getElementById('progressFill');
-  const progressPct  = document.getElementById('progressPct');
+  const fileInput   = document.getElementById('fileInput');
+  const dropzone    = document.getElementById('dropzone');
+  const fileList    = document.getElementById('fileList');
+  const sendBtn     = document.getElementById('sendBtn');
+  const cancelBtn   = document.getElementById('cancelBtn');
+  const statusEl    = document.getElementById('status');
+  const apiKey      = document.getElementById('apiKey');
+  const keyToggle   = document.getElementById('keyToggle');
+  const overall     = document.getElementById('overall');
+  const overallFill = document.getElementById('overallFill');
+  const overallLabel= document.getElementById('overallLabel');
+
+  // Each queued file is {id, file, xhr, status: 'queued'|'uploading'|'done'|'failed'|'canceled'}
+  let queue = [];
+  let uploading = false;
+  let nextId = 1;
+
+  const fileIconSvg =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
+  const removeIconSvg =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+  const okIconSvg =
+    '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+  const failIconSvg =
+    '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
 
   function fmtSize(bytes){
     if (bytes < 1024) return bytes + ' B';
@@ -326,15 +424,79 @@ PAGE_HTML = """<!DOCTYPE html>
   }
 
   function updateSendState(){
-    sendBtn.disabled = !(fileInput.files.length && apiKey.value);
+    const hasFiles = queue.some(q => q.status === 'queued' || q.status === 'failed' || q.status === 'canceled');
+    sendBtn.disabled = uploading || !(hasFiles && apiKey.value);
   }
 
-  keyToggle.addEventListener('click', () => {
-    const showing = apiKey.type === 'text';
-    apiKey.type = showing ? 'password' : 'text';
-    keyToggle.textContent = showing ? 'show' : 'hide';
-  });
-  apiKey.addEventListener('input', updateSendState);
+  function renderQueue(){
+    fileList.innerHTML = '';
+    queue.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'file-row' + (item.status === 'done' ? ' done' : item.status === 'failed' ? ' failed' : '');
+      row.dataset.id = item.id;
+
+      const icon = document.createElement('div');
+      icon.className = 'ficon';
+      icon.innerHTML = fileIconSvg;
+
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const nameEl = document.createElement('div');
+      nameEl.className = 'name';
+      nameEl.textContent = item.file.name;
+      const subEl = document.createElement('div');
+      subEl.className = 'sub-line' + (item.status === 'failed' ? ' err' : item.status === 'done' ? ' ok' : '');
+      subEl.textContent = item.status === 'done' ? 'Uploaded \u00b7 ' + fmtSize(item.file.size)
+                         : item.status === 'failed' ? (item.errorMsg || 'Failed')
+                         : item.status === 'uploading' ? 'Uploading\u2026'
+                         : item.status === 'canceled' ? 'Canceled'
+                         : fmtSize(item.file.size);
+      meta.appendChild(nameEl);
+      meta.appendChild(subEl);
+
+      if (item.status === 'uploading' || item.status === 'queued'){
+        const track = document.createElement('div');
+        track.className = 'row-track';
+        const fill = document.createElement('div');
+        fill.className = 'row-fill';
+        fill.style.width = (item.pct || 0) + '%';
+        track.appendChild(fill);
+        meta.appendChild(track);
+      }
+
+      const statusIcon = document.createElement('div');
+      statusIcon.className = 'status-icon';
+      statusIcon.innerHTML = item.status === 'done' ? okIconSvg : item.status === 'failed' ? failIconSvg : '';
+
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'remove';
+      removeBtn.setAttribute('aria-label', 'Remove file');
+      removeBtn.innerHTML = removeIconSvg;
+      removeBtn.addEventListener('click', () => removeFile(item.id));
+      // don't allow removing a file mid-flight; cancel the whole batch instead
+      if (item.status === 'uploading') removeBtn.disabled = true, removeBtn.style.opacity = '0.2', removeBtn.style.cursor = 'default';
+
+      row.appendChild(icon);
+      row.appendChild(meta);
+      row.appendChild(statusIcon);
+      row.appendChild(removeBtn);
+      fileList.appendChild(row);
+    });
+    updateSendState();
+  }
+
+  function addFiles(fileListObj){
+    for (const f of fileListObj){
+      queue.push({ id: nextId++, file: f, status: 'queued', pct: 0 });
+    }
+    renderQueue();
+  }
+
+  function removeFile(id){
+    queue = queue.filter(q => q.id !== id);
+    renderQueue();
+  }
 
   dropzone.addEventListener('click', () => fileInput.click());
 
@@ -352,104 +514,154 @@ PAGE_HTML = """<!DOCTYPE html>
   });
   dropzone.addEventListener('drop', e => {
     const dt = e.dataTransfer;
-    if (dt && dt.files && dt.files.length){
-      fileInput.files = dt.files;
-      fileInput.dispatchEvent(new Event('change'));
-    }
+    if (dt && dt.files && dt.files.length) addFiles(dt.files);
   });
 
   fileInput.addEventListener('change', () => {
-    if (fileInput.files.length){
-      const f = fileInput.files[0];
-      pickedName.textContent = f.name;
-      pickedSize.textContent = fmtSize(f.size);
-      picked.classList.add('show');
+    if (fileInput.files.length) addFiles(fileInput.files);
+    fileInput.value = ''; // allow re-selecting the same file(s) later
+  });
+
+  keyToggle.addEventListener('click', () => {
+    const showing = apiKey.type === 'text';
+    apiKey.type = showing ? 'password' : 'text';
+    keyToggle.textContent = showing ? 'show' : 'hide';
+  });
+  apiKey.addEventListener('input', updateSendState);
+
+  function updateOverallProgress(){
+    const total = queue.length;
+    if (!total){ overall.classList.remove('show'); return; }
+    const doneCount = queue.filter(q => q.status === 'done').length;
+    const failedCount = queue.filter(q => q.status === 'failed' || q.status === 'canceled').length;
+    const uploadingItem = queue.find(q => q.status === 'uploading');
+    let pct;
+    if (doneCount + failedCount === total){
+      pct = 100;
     } else {
-      picked.classList.remove('show');
+      const inProgress = uploadingItem ? (uploadingItem.pct || 0) / 100 : 0;
+      pct = Math.round(((doneCount + failedCount + inProgress) / total) * 100);
     }
-    updateSendState();
-  });
+    overallFill.style.width = pct + '%';
+    overallLabel.textContent = doneCount + ' / ' + total + ' uploaded' + (failedCount ? ' (' + failedCount + ' failed)' : '');
+  }
 
-  pickedClear.addEventListener('click', (e) => {
-    e.stopPropagation();
-    fileInput.value = '';
-    picked.classList.remove('show');
-    updateSendState();
-  });
+  async function computeAuthHeaders(){
+    const hasSubtle = window.isSecureContext && window.crypto && window.crypto.subtle;
+    if (hasSubtle){
+      const nonceRes = await fetch('/nonce', { cache: 'no-store' });
+      if (!nonceRes.ok) throw new Error('nonce request failed: ' + nonceRes.status);
+      const { nonce } = await nonceRes.json();
+      const enc = new TextEncoder();
+      const cryptoKey = await crypto.subtle.importKey(
+        'raw', enc.encode(apiKey.value), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+      );
+      const sigBuf = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(nonce));
+      const authToken = Array.from(new Uint8Array(sigBuf))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+      return { 'X-Nonce': nonce, 'X-Auth-Token': authToken };
+    }
+    // Insecure context (plain http:// on a LAN IP, etc): crypto.subtle is
+    // unavailable outside secure contexts. Fall back to the same plain
+    // X-API-Key header curl already uses.
+    return { 'X-API-Key': apiKey.value };
+  }
 
-  function xhrUpload(url, headers, formData){
-    return new Promise((resolve, reject) => {
+  function uploadOne(item, headers){
+    return new Promise((resolve) => {
+      const fd = new FormData();
+      fd.append('file', item.file);
       const xhr = new XMLHttpRequest();
-      xhr.open('POST', url);
+      item.xhr = xhr;
+      xhr.open('POST', '/upload');
       Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
       xhr.upload.addEventListener('progress', (e) => {
         if (e.lengthComputable){
-          const pct = Math.round((e.loaded / e.total) * 100);
-          progressFill.style.width = pct + '%';
-          progressPct.textContent = pct + '%';
+          item.pct = Math.round((e.loaded / e.total) * 100);
+          renderQueue();
+          updateOverallProgress();
         }
       });
-      xhr.addEventListener('load', () => resolve(xhr));
-      xhr.addEventListener('error', () => reject(new Error('network error')));
-      xhr.addEventListener('timeout', () => reject(new Error('timed out')));
-      xhr.send(formData);
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300){
+          item.status = 'done'; item.pct = 100;
+        } else {
+          item.status = 'failed'; item.errorMsg = 'HTTP ' + xhr.status;
+        }
+        resolve();
+      });
+      xhr.addEventListener('error', () => {
+        item.status = 'failed'; item.errorMsg = 'Network error';
+        resolve();
+      });
+      xhr.addEventListener('abort', () => {
+        item.status = 'canceled';
+        resolve();
+      });
+      xhr.send(fd);
     });
   }
 
-  sendBtn.addEventListener('click', async () => {
-    if (!fileInput.files.length){ setStatus('Choose a file first.', 'err'); return; }
-    if (!apiKey.value){ setStatus('Enter your API key.', 'err'); return; }
+  let canceledByUser = false;
 
+  sendBtn.addEventListener('click', async () => {
+    const pending = queue.filter(q => q.status === 'queued' || q.status === 'failed' || q.status === 'canceled');
+    if (!pending.length){ setStatus('Choose at least one file.', 'err'); return; }
+    if (!apiKey.value){ setStatus('Enter your API key or password.', 'err'); return; }
+
+    uploading = true;
+    canceledByUser = false;
     sendBtn.disabled = true;
-    progressWrap.classList.add('show');
-    progressFill.style.width = '0%';
-    progressPct.textContent = '0%';
+    cancelBtn.classList.add('show');
+    overall.classList.add('show');
     setStatus('Preparing upload...', 'info');
 
+    pending.forEach(q => { q.status = 'queued'; q.pct = 0; q.errorMsg = null; });
+    renderQueue();
+    updateOverallProgress();
+
     try{
-      const fd = new FormData();
-      fd.append('file', fileInput.files[0]);
+      const headers = await computeAuthHeaders();
+      setStatus('Uploading...', 'info');
 
-      const hasSubtle = window.isSecureContext && window.crypto && window.crypto.subtle;
-      let headers;
-
-      if (hasSubtle) {
-        setStatus('Authenticating...', 'info');
-        const nonceRes = await fetch('/nonce', { cache: 'no-store' });
-        if (!nonceRes.ok) throw new Error('nonce request failed: ' + nonceRes.status);
-        const { nonce } = await nonceRes.json();
-
-        const enc = new TextEncoder();
-        const cryptoKey = await crypto.subtle.importKey(
-          'raw', enc.encode(apiKey.value), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-        );
-        const sigBuf = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(nonce));
-        const authToken = Array.from(new Uint8Array(sigBuf))
-          .map(b => b.toString(16).padStart(2, '0')).join('');
-
-        headers = { 'X-Nonce': nonce, 'X-Auth-Token': authToken };
-      } else {
-        // Insecure context (plain http:// on a LAN IP, etc): crypto.subtle is
-        // unavailable outside secure contexts. Fall back to the same plain
-        // X-API-Key header curl already uses.
-        headers = { 'X-API-Key': apiKey.value };
+      for (const item of pending){
+        if (canceledByUser){ item.status = 'canceled'; renderQueue(); continue; }
+        item.status = 'uploading';
+        renderQueue();
+        await uploadOne(item, headers);
+        renderQueue();
+        updateOverallProgress();
       }
 
-      setStatus('Uploading...', 'info');
-      const xhr = await xhrUpload('/upload', headers, fd);
-
-      if (xhr.status >= 200 && xhr.status < 300){
-        setStatus('Uploaded successfully.', 'ok');
-        progressFill.style.width = '100%';
-        progressPct.textContent = '100%';
+      const failedCount = queue.filter(q => q.status === 'failed').length;
+      const canceledCount = queue.filter(q => q.status === 'canceled').length;
+      if (canceledByUser){
+        setStatus('Upload canceled.', 'err');
+      } else if (failedCount){
+        setStatus(failedCount + ' file(s) failed \u2014 check and retry.', 'err');
       } else {
-        setStatus('Failed: HTTP ' + xhr.status + ' (check key or file).', 'err');
+        setStatus('All files uploaded successfully.', 'ok');
       }
     } catch(e){
       setStatus('Error: ' + (e && e.message ? e.message : 'request failed'), 'err');
     }
-    sendBtn.disabled = false;
+
+    uploading = false;
+    cancelBtn.classList.remove('show');
     updateSendState();
+  });
+
+  cancelBtn.addEventListener('click', () => {
+    canceledByUser = true;
+    queue.forEach(item => {
+      if (item.status === 'uploading' && item.xhr){
+        item.xhr.abort();
+      } else if (item.status === 'queued'){
+        item.status = 'canceled';
+      }
+    });
+    renderQueue();
+    setStatus('Canceling...', 'info');
   });
 </script>
 </body>
@@ -853,14 +1065,21 @@ class Handler(BaseHTTPRequestHandler):
     def _smuggling_guard(self) -> bool:
         """Reject requests that mix Transfer-Encoding with Content-Length, or
         use chunked/unsupported encodings -- classic request-smuggling vectors
-        this server has no reason to ever need to support."""
+        this server has no reason to ever need to support. Also rejects
+        duplicate Content-Length headers with conflicting values, since
+        self.headers.get() silently returns only the first occurrence and
+        would otherwise hide a smuggling attempt using a second header."""
         te = self.headers.get("Transfer-Encoding", "")
-        cl = self.headers.get("Content-Length")
         if te:
             return False  # this server never supports Transfer-Encoding at all
-        if cl is not None:
+
+        cl_values = self.headers.get_all("Content-Length")
+        if cl_values:
+            distinct = set(v.strip() for v in cl_values)
+            if len(distinct) > 1:
+                return False  # conflicting Content-Length headers -- smuggling attempt
             try:
-                if int(cl) < 0:
+                if int(cl_values[0]) < 0:
                     return False
             except ValueError:
                 return False
@@ -965,12 +1184,11 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             body = self.rfile.read(length)
-            result = parse_multipart_file(body, content_type)
-            if result is None:
+            files = parse_multipart_files(body, content_type)
+            if not files:
                 self._deny(400)
                 return
-            filename, file_bytes = result
-            if not filename:
+            if len(files) > MAX_FILES_PER_UPLOAD:
                 self._deny(400)
                 return
 
@@ -980,25 +1198,42 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            fname = safe_filename(filename)
-            dest = os.path.join(UPLOAD_DIR, fname)
-            with open(dest, "wb") as out:
-                out.write(file_bytes)
-            os.chmod(dest, 0o600)
+            stored = []
+            for filename, file_bytes in files:
+                if not filename:
+                    continue
+                fname = safe_filename(filename)
+                dest = os.path.join(UPLOAD_DIR, fname)
+                with open(dest, "wb") as out:
+                    out.write(file_bytes)
+                os.chmod(dest, 0o600)
+                stored.append(fname)
+                self.log_message("upload ok from %s -> %s", client_ip, fname)
 
-            self.log_message("upload ok from %s -> %s", client_ip, fname)
-            self._ok({"status": "ok", "stored_as": fname})
+            if not stored:
+                self._deny(400)
+                return
+
+            self._ok({"status": "ok", "stored_as": stored, "count": len(stored)})
         except Exception:
             self._deny(400)
 
 
 def daemonize(log_path):
     """Classic double-fork so the server keeps running after the terminal closes."""
-    if os.fork() > 0:
-        sys.exit(0)
-    os.setsid()
-    if os.fork() > 0:
-        sys.exit(0)
+    if not hasattr(os, "fork"):
+        print("Background mode (-d) needs os.fork(), which isn't available on")
+        print("this platform. Run without -d instead (foreground).")
+        sys.exit(1)
+    try:
+        if os.fork() > 0:
+            sys.exit(0)
+        os.setsid()
+        if os.fork() > 0:
+            sys.exit(0)
+    except OSError as e:
+        print(f"Could not daemonize (fork failed: {e}). Running in the foreground instead.")
+        return
     sys.stdout.flush()
     sys.stderr.flush()
     log_fd = open(log_path, "a+")
@@ -1009,12 +1244,32 @@ def daemonize(log_path):
 
 
 def run(port):
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    try:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+    except PermissionError:
+        print(f"Permission denied creating upload directory: {UPLOAD_DIR}")
+        print("Set a writable location with the PYU_UPLOAD_DIR environment variable, e.g.:")
+        print(f'  PYU_UPLOAD_DIR="$HOME/pyu-uploads" python3 {os.path.basename(__file__)} -p {port}')
+        sys.exit(1)
+    except OSError as e:
+        print(f"Could not create upload directory {UPLOAD_DIR}: {e}")
+        sys.exit(1)
     try:
         os.chmod(UPLOAD_DIR, 0o700)
     except Exception:
         pass
-    server = ThreadingHTTPServer((HOST, port), Handler)
+    try:
+        server = ThreadingHTTPServer((HOST, port), Handler)
+    except OSError as e:
+        if e.errno == 98:  # EADDRINUSE
+            print(f"Port {port} is already in use. Pick another with -p, or stop")
+            print(f"whatever else is listening on it (e.g. an old pyu.py instance).")
+        elif e.errno == 13:  # EACCES
+            print(f"Permission denied binding port {port}. Ports below 1024 need")
+            print("elevated privileges on most systems -- try a port above 1024.")
+        else:
+            print(f"Could not bind {HOST}:{port} -- {e}")
+        sys.exit(1)
     server.daemon_threads = True     # don't block process exit on stuck handlers
     server.request_queue_size = 32   # bound the backlog rather than accept unbounded
     print(f"Listening on {HOST}:{port}, uploads -> {UPLOAD_DIR}")
