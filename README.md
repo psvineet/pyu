@@ -64,13 +64,17 @@ first run, on your machine.
   files `600`.
 - **Multi-file upload, with cancel** — select or drag in any number of
   files at once (up to `MAX_FILES_PER_UPLOAD`, default 20, and the usual
-  `MAX_UPLOAD_BYTES` combined size cap). Each file gets its own row with
-  live progress, a per-file remove button before upload starts, and a
-  clear done/failed indicator after. A Cancel button aborts in-flight and
-  queued uploads immediately (`XMLHttpRequest.abort()`), and canceled or
-  failed files can be resubmitted with one more click on Upload — no need
-  to re-pick them. The server also accepts multiple files in a single
-  `curl` request via repeated `-F "file=@..."` flags.
+  `MAX_UPLOAD_BYTES` combined size cap — both adjustable at runtime via
+  environment variable, see [Configuration](#configuration)). Each file
+  gets its own row with live progress, a per-file remove button before
+  upload starts, and a clear done/failed indicator after. A Cancel button
+  aborts in-flight and queued uploads immediately
+  (`XMLHttpRequest.abort()`), and canceled or failed files can be
+  resubmitted with one more click on Upload — no need to re-pick them.
+  The server also accepts multiple files in a single `curl` request via
+  repeated `-F "file=@..."` flags. The web page always shows the actual
+  configured limits under the drop zone, so it never goes stale relative
+  to the server's real settings.
 - **Redesigned web upload page** — card layout, drag-and-drop file zone
   (tap-to-browse on mobile), live per-file and overall upload progress,
   filename/size preview with a remove button, show/hide toggle on the
@@ -111,6 +115,30 @@ cd pyu
 ```
 
 Nothing to `pip install`.
+
+---
+
+## Get it live in under a minute
+
+For a quick local test or a same-network drop, skip straight to a
+running server with no domain, no TLS wizard, nothing else to set up:
+
+```bash
+python3 pyu.py -i      # generates config + prints your API key once
+python3 pyu.py         # starts listening on 0.0.0.0:8820
+```
+
+Then, from any device on the same network, open
+`http://<this-machine's-LAN-IP>:8820/` in a browser and paste in the key
+that was printed. That's the entire setup — everything past this point
+(Cloudflare Tunnel, a real domain, background/daemon mode, password auth)
+is for when you want it reachable from outside your network or running
+unattended. See [Quick start](#quick-start) below for those steps.
+
+> This bare setup speaks plain HTTP and is only appropriate on a network
+> you trust (home Wi-Fi, a private LAN). Don't port-forward this
+> straight to the internet without TLS in front of it — see
+> [Exposing it publicly](#exposing-it-publicly).
 
 ---
 
@@ -287,8 +315,8 @@ Edit the constants near the top of `pyu.py`:
 | `PORT`              | `8820`                                        | Listen port                       |
 | `HOST`              | `0.0.0.0`                                     | Listen address                    |
 | `UPLOAD_DIR`        | Termux: `/storage/emulated/0/Android/endpoint`.<br>Everywhere else: `<script dir>/uploads` | Where uploads are saved |
-| `MAX_UPLOAD_BYTES`  | `200 * 1024 * 1024` (200 MB)                  | Hard cap on total request size (all files combined) |
-| `MAX_FILES_PER_UPLOAD` | `20`                                       | Max number of files accepted in one request |
+| `MAX_UPLOAD_BYTES`  | `200 * 1024 * 1024` (200 MB)                  | Hard cap on total request size (all files combined). Override with `PYU_MAX_UPLOAD_MB` (in MB) |
+| `MAX_FILES_PER_UPLOAD` | `20`                                       | Max number of files accepted in one request. Override with `PYU_MAX_FILES_PER_UPLOAD` |
 | `RATE_LIMIT_WINDOW` | `10` seconds                                  | General per-IP rate-limit window  |
 | `RATE_LIMIT_MAX`    | `20`                                          | Max requests per IP per window    |
 | `TUNNEL_NAME`       | `pyu-tunnel`                                  | Name used for the Cloudflare tunnel |
@@ -309,6 +337,26 @@ hash cost and is defined next to `pbkdf2_hash()`.
 > ```bash
 > PYU_UPLOAD_DIR="$HOME/pyu-uploads" python3 pyu.py
 > ```
+
+> **Increasing the upload limit.** `MAX_UPLOAD_BYTES` and
+> `MAX_FILES_PER_UPLOAD` can both be set via environment variable
+> instead of editing the script — no restart-and-edit cycle needed:
+> ```bash
+> PYU_MAX_UPLOAD_MB=1024 PYU_MAX_FILES_PER_UPLOAD=50 python3 pyu.py
+> ```
+> This raises the combined per-request cap to 1&nbsp;GB and allows up to
+> 50 files in one request. `PYU_MAX_UPLOAD_MB` is in **megabytes**, not
+> bytes, to keep the number short — `1024` here means 1024 MB (1 GB).
+> The web upload page reads whatever limits are actually configured and
+> displays them live under the drop zone, so the two never drift apart.
+> A malformed value (non-numeric, zero, or negative) is ignored with a
+> warning printed to the console, and the built-in default is used
+> instead — it won't crash the server on a typo.
+> 
+> These apply for the current run only; set them permanently by
+> exporting them in your shell profile, or by editing the `MAX_UPLOAD_BYTES`
+> / `MAX_FILES_PER_UPLOAD` lines directly in `pyu.py` if you'd rather
+> have a fixed value baked in.
 
 > **Termux path note:** the correct storage path is
 > `/storage/emulated/0/Android/endpoint`, not `/storage/0/emulated/0/...`,
