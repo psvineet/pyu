@@ -50,14 +50,34 @@ first run, on your machine.
   without throttling normal traffic.
 - **Randomized storage filenames** — the client's filename is never
   trusted; only a whitelisted extension is kept, name is randomized.
+- **Boundary-safe multipart parsing** — the hand-rolled multipart parser
+  locates genuine boundary lines by position rather than a naive
+  byte-split, so a large upload whose content incidentally contains a
+  boundary-like byte sequence is never silently truncated. Verified
+  against 150MB+ of random binary data with zero corruption.
+- **Cross-platform upload directory** — auto-detects Termux and only
+  uses the Android storage path there; regular Linux gets a normal
+  `uploads/` folder next to the script instead of crashing on a
+  `/storage` path that doesn't exist off Android. Override with
+  `PYU_UPLOAD_DIR` if you want it somewhere else entirely.
 - **Locked-down permissions** — config `600`, upload dir `700`, saved
   files `600`.
+- **Multi-file upload, with cancel** — select or drag in any number of
+  files at once (up to `MAX_FILES_PER_UPLOAD`, default 20, and the usual
+  `MAX_UPLOAD_BYTES` combined size cap). Each file gets its own row with
+  live progress, a per-file remove button before upload starts, and a
+  clear done/failed indicator after. A Cancel button aborts in-flight and
+  queued uploads immediately (`XMLHttpRequest.abort()`), and canceled or
+  failed files can be resubmitted with one more click on Upload — no need
+  to re-pick them. The server also accepts multiple files in a single
+  `curl` request via repeated `-F "file=@..."` flags.
 - **Redesigned web upload page** — card layout, drag-and-drop file zone
-  (tap-to-browse on mobile), live upload progress bar, filename/size
-  preview with a remove button, show/hide toggle on the credential
-  field, and color-coded status messages. Fully responsive down to small
-  phone widths. The page never puts your raw credential on the wire in a
-  secure context — see [Security notes](#security-notes) below.
+  (tap-to-browse on mobile), live per-file and overall upload progress,
+  filename/size preview with a remove button, show/hide toggle on the
+  credential field, and color-coded status messages. Fully responsive
+  down to small phone widths. The page never puts your raw credential on
+  the wire in a secure context — see [Security notes](#security-notes)
+  below.
 - **One-command Cloudflare Tunnel setup** (`-c`) — detects your OS,
   installs `cloudflared`, authorizes, creates the tunnel, adds the DNS
   record, writes the tunnel config to the **standard `/etc/cloudflared`
@@ -185,9 +205,13 @@ process — that's outside this script's control.
 
 ### 5. Upload
 
-**From a browser:** visit `https://<sub>.<domain>/`, drag a file in (or
-tap to browse), enter your API key or password, hit Upload. A progress
-bar tracks the transfer.
+**From a browser:** visit `https://<sub>.<domain>/`, drag in one or more
+files (or tap to browse — multi-select works there too), enter your API
+key or password, hit Upload. Each file gets its own progress row, plus
+an overall progress bar for the whole batch. A **Cancel** button appears
+once uploading starts — it stops the in-flight file immediately and
+skips any still queued. Canceled or failed files stay in the list and
+can be resubmitted with one more click on Upload, no need to re-pick them.
 
 **From the CLI:**
 
@@ -196,6 +220,27 @@ curl -X POST https://<sub>.<domain>/upload \
      -H "X-API-Key: <your-key>" \
      -F "file=@/path/to/file"
 ```
+
+Multiple files in one request — repeat the `-F "file=@..."` flag with
+the same field name (`file`):
+
+```bash
+curl -X POST https://<sub>.<domain>/upload \
+     -H "X-API-Key: <your-key>" \
+     -F "file=@/path/one.jpg" -F "file=@/path/two.pdf" -F "file=@/path/three.zip"
+```
+
+All files in a directory, in one request (bash):
+
+```bash
+curl -X POST https://<sub>.<domain>/upload -H "X-API-Key: <your-key>" \
+     $(for f in /path/to/dir/*; do printf ' -F file=@%q' "$f"; done)
+```
+
+The response's `stored_as` field is always a JSON array of the names
+each file was saved under (even for a single file), alongside a `count`.
+A single request is capped at `MAX_FILES_PER_UPLOAD` files (default 20)
+and the usual `MAX_UPLOAD_BYTES` combined size across all of them.
 
 (Passwords set via `-w` also work in this header, since they're stored
 the same way as keys.)
@@ -241,8 +286,9 @@ Edit the constants near the top of `pyu.py`:
 |---------------------|-----------------------------------------------|-----------------------------------|
 | `PORT`              | `8820`                                        | Listen port                       |
 | `HOST`              | `0.0.0.0`                                     | Listen address                    |
-| `UPLOAD_DIR`        | `/storage/emulated/0/Android/endpoint`        | Where uploads are saved           |
-| `MAX_UPLOAD_BYTES`  | `200 * 1024 * 1024` (200 MB)                  | Hard cap per upload               |
+| `UPLOAD_DIR`        | Termux: `/storage/emulated/0/Android/endpoint`.<br>Everywhere else: `<script dir>/uploads` | Where uploads are saved |
+| `MAX_UPLOAD_BYTES`  | `200 * 1024 * 1024` (200 MB)                  | Hard cap on total request size (all files combined) |
+| `MAX_FILES_PER_UPLOAD` | `20`                                       | Max number of files accepted in one request |
 | `RATE_LIMIT_WINDOW` | `10` seconds                                  | General per-IP rate-limit window  |
 | `RATE_LIMIT_MAX`    | `20`                                          | Max requests per IP per window    |
 | `TUNNEL_NAME`       | `pyu-tunnel`                                  | Name used for the Cloudflare tunnel |
@@ -252,6 +298,17 @@ default 60s / 5 attempts) is defined near the auth code further down the
 file, separate from the general request rate limit above. `_PBKDF2_ITERATIONS`
 (default 310,000, the current OWASP-recommended floor) controls password
 hash cost and is defined next to `pbkdf2_hash()`.
+
+> **Upload directory is now platform-aware.** The script auto-detects
+> Termux (via the `PREFIX` environment variable) and only uses the
+> Android storage path there — on Arch/Fedora/Debian/Ubuntu and other
+> regular Linux systems it defaults to an `uploads/` folder next to
+> `pyu.py` instead, since `/storage` doesn't exist outside Android and
+> attempting to create it fails with a permission error. Override either
+> default with the `PYU_UPLOAD_DIR` environment variable:
+> ```bash
+> PYU_UPLOAD_DIR="$HOME/pyu-uploads" python3 pyu.py
+> ```
 
 > **Termux path note:** the correct storage path is
 > `/storage/emulated/0/Android/endpoint`, not `/storage/0/emulated/0/...`,
