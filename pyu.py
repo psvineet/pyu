@@ -104,13 +104,36 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "pyu_config.json")   # secrets + domain
 # cloudflared's own config/creds/cert now live in the standard /etc location
 # (or Termux's $PREFIX/etc equivalent) -- see etc_cloudflared_dir() below.
-MAX_UPLOAD_BYTES = 200 * 1024 * 1024   # 200 MB hard cap, tune as needed
-MAX_FILES_PER_UPLOAD = 20              # cap on files accepted in a single multi-file request
 ALLOWED_PATH = "/upload"               # the ONLY POST route that exists
 RATE_LIMIT_WINDOW = 10                 # seconds
 RATE_LIMIT_MAX = 20                    # max requests per IP per window
 TUNNEL_NAME = "pyu-tunnel"
 # ---------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a positive integer from an environment variable, falling back
+    to default on anything missing or malformed rather than crashing at
+    import time over a typo'd env var."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+        return value
+    except ValueError:
+        print(f"Warning: {name}='{raw}' is not a positive integer, using default ({default}).")
+        return default
+
+
+# Upload size/count limits -- override via environment variable without
+# touching source, e.g.:
+#   PYU_MAX_UPLOAD_MB=1024 python3 pyu.py         # raise combined cap to 1GB
+#   PYU_MAX_FILES_PER_UPLOAD=50 python3 pyu.py    # allow up to 50 files/request
+MAX_UPLOAD_BYTES = _env_int("PYU_MAX_UPLOAD_MB", 200) * 1024 * 1024
+MAX_FILES_PER_UPLOAD = _env_int("PYU_MAX_FILES_PER_UPLOAD", 20)
 
 
 def _default_upload_dir() -> str:
@@ -366,7 +389,7 @@ PAGE_HTML = """<!DOCTYPE html>
         </svg>
       </div>
       <div class="dz-main">Tap to choose, or drag files here</div>
-      <div class="dz-sub">Multiple files supported, up to 200&nbsp;MB total</div>
+      <div class="dz-sub">Multiple files supported, up to __PYU_LIMIT_TEXT__</div>
     </div>
     <input type="file" id="fileInput" multiple>
 
@@ -621,13 +644,16 @@ PAGE_HTML = """<!DOCTYPE html>
     updateOverallProgress();
 
     try{
-      const headers = await computeAuthHeaders();
       setStatus('Uploading...', 'info');
 
       for (const item of pending){
         if (canceledByUser){ item.status = 'canceled'; renderQueue(); continue; }
         item.status = 'uploading';
         renderQueue();
+        // Fresh auth headers per file: a nonce is single-use and gets
+        // consumed by the first upload, so reusing one across a batch
+        // makes every file after the first fail auth.
+        const headers = await computeAuthHeaders();
         await uploadOne(item, headers);
         renderQueue();
         updateOverallProgress();
@@ -1053,7 +1079,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_page(self):
-        body = PAGE_HTML.encode("utf-8")
+        mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+        limit_text = f"{mb:,}&nbsp;MB total, {MAX_FILES_PER_UPLOAD} files max"
+        rendered = PAGE_HTML.replace("__PYU_LIMIT_TEXT__", limit_text)
+        body = rendered.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
